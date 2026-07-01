@@ -1,0 +1,11 @@
+{
+  "cast_id": "euclid",
+  "name": "欧几里得",
+  "kind": "character",
+  "bucket": "consistent",
+  "description": "一位年迈的古希腊学者，头戴深灰色尖顶软帽，露出饱满的额头与紧锁的眉头。他留着浓密而漫长的灰白色卷须，胡须几乎垂至胸前。身穿外层敞开的大红色长袍，内搭浅米黄色的宽松长衣，衣袖宽大。他正微微前倾，神情专注，右手持圆规在面前的平面（石板或纸卷）上绘制几何线条，左手按住纸面。整体气质沉稳、睿智，带有公元前亚历山大城学者的标志性特征。",
+  "reference_images": [
+    "casts/consistent/images/character_euclid_example.jpg",
+    "casts/consistent/images/character_euclid_design.jpg"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "cast_id": "nanjing_yangtze_river_bridge",
+  "name": "南京长江大桥",
+  "kind": "location",
+  "bucket": "chapter_8",
+  "description": "一座横贯宽阔江面的双层钢结构大桥。最显眼的是桥头两侧高耸的米黄色方形桥塔，塔顶装饰有鲜红色的桥头堡雕塑。上层为双向公路桥面，车流穿梭；下层为铁路轨道桥，钢铁桁架呈连续的菱形网格延伸向远方。桥塔墙面上有纵向排列的文字标语。背景是黄昏下的现代城市天际线与开阔的江面，江岸边绿树成荫，体现出二十世纪中期大型公铁两用桥的雄浑风格。",
+  "reference_images": [
+    "casts/chapters/chapter_8/images/environment_nanjing_yangtze_river_bridge_example.jpg"
+  ]
+}

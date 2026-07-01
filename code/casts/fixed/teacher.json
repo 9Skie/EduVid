@@ -1,0 +1,17 @@
+{
+  "cast_id": "teacher",
+  "is_anchor": true,
+  "name": "老师",
+  "kind": "character",
+  "bucket": "fixed",
+  "origin": "real",
+  "speaks": false,
+  "description": "一位成年中国男教师，约三十多岁，亲切、有耐心、有权威感的神情，得体的日常教师着装。",
+  "reference_images": [
+    "casts/fixed/images/character_teacher_example.jpg",
+    "casts/fixed/images/character_teacher_design.jpg"
+  ],
+  "presence": "画面中的主讲老师形象，按需出现（与 consistent 角色一样，由分镜环节决定是否入镜），从不说话——讲解均为旁白；入镜时只做引导性的手势、点头与表情。",
+  "age_rule": "固定为成年教师形象，不随年级变化；以老师提供的真实照片为锚定生成风格化形象（origin: real）。",
+  "_note": "description 与 reference_images 由阶段 5 的 anchor 生成步骤按年级/照片填充并覆盖。"
+}

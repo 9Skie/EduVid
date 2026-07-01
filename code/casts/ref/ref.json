@@ -1,0 +1,31 @@
+{
+  "characters": {
+    "example": [
+      {
+        "label": "scientist",
+        "prompt": "Smooth, polished Pixar 3D in the art style of the movie Coco, soft rounded features and large expressive eyes, simple naturalistic clothing rendered with subtle fabric texture. Realistic human body proportions (not chibi), expressive sculpted faces. A male scientist around 50 years old, wearing a white lab coat over a buttoned shirt, wire-rimmed glasses. He has thoughtful, observant eyes, greying hair at the temples. He holds a notebook casually, expression calm and intellectual. Clean neutral background, centered portrait composition.",
+        "image": "images/character_scientist_example.jpg"
+      }
+    ],
+    "design": [
+      {
+        "label": "scientist",
+        "prompt": "Smooth, polished Pixar 3D in the art style of the movie Coco, soft rounded features and large expressive eyes, simple naturalistic clothing rendered with subtle fabric texture. Realistic human body proportions (not chibi), expressive sculpted faces. Create a character model sheet following the layout of the reference model sheet image. Show multiple views: front view, side view, back view, and close-up detail shots of key features. Keep the character design consistent with the provided character portrait. Clean white background, professional character design turnaround.",
+        "image": "images/character_scientist_design.jpg",
+        "input_references": [
+          "images/character_scientist_example.jpg",
+          "images/character_model_sheet_ref.jpg"
+        ]
+      }
+    ]
+  },
+  "environments": {
+    "example": [
+      {
+        "label": "city",
+        "prompt": "Smooth, polished Pixar 3D in the art style of the movie Coco, warm lighting, soft atmospheric depth, rich color palette. A bustling modern city scene with tall glass buildings, busy streets with cars and pedestrians, warm golden hour sunlight casting long shadows across facades. Clean atmospheric perspective, vibrant urban environment.",
+        "image": "images/environment_city_example.jpg"
+      }
+    ]
+  }
+}

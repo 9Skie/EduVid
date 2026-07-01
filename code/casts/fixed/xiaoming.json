@@ -1,0 +1,17 @@
+{
+  "cast_id": "xiaoming",
+  "is_anchor": true,
+  "name": "小明",
+  "kind": "character",
+  "bucket": "fixed",
+  "origin": "fictional",
+  "speaks": false,
+  "description": "一名约13岁的中国男学生，符合该年龄段的身形与脸庞；短发，整洁的日常校园穿着，好奇、外向的神情。与小红外观明显区分（性别、发型、配色）。",
+  "reference_images": [
+    "casts/fixed/images/character_xiaoming_example.jpg",
+    "casts/fixed/images/character_xiaoming_design.jpg"
+  ],
+  "presence": "画面中的男学生形象，代表观众里的同龄人；按需出现（与 consistent 角色一样，由分镜环节决定是否入镜），从不说话——讲解均为旁白；入镜时只做倾听、好奇张望与反应。",
+  "age_rule": "年龄随教学年级变化（约为 年级 + 5 岁，一年级 6 岁起）；外观随年龄生成，但身份保持一致。",
+  "_note": "description 与 reference_images 由阶段 5 的 anchor 生成步骤按年级填充并覆盖。"
+}
