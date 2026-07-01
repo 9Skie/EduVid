@@ -342,17 +342,18 @@ def validate_designs(designs_by_id, clips):
 
 # ── Seedance segment splitting ────────────────────────────────────────
 #
-# Seedance clips must be 2-15s. Stage 7 isn't told this (so it can think in
-# whole scenes), so stage 8 splits long seedance shots post-hoc:
+# Seedance clips must be 4-15s (seedance-2.0's supported_durations start at 4s —
+# anything shorter is an invalid request). Stage 7 isn't told this (so it can
+# think in whole scenes), so stage 8 splits long seedance shots post-hoc:
 #   - cut COUNT (N) and ideal positions: programmatic (equal division)
 #   - cut POSITION (which char boundary): LLM picks, for semantic naturalness
-#   - hard [2s, 15s] guard: programmatic; falls back to equal split if the
+#   - hard [4s, 15s] guard: programmatic; falls back to equal split if the
 #     LLM's choice is illegal
 # Per-segment motion prompts are NOT derived here — that needs real generated
 # frames and happens in stage 9 (segment k's prompt derived from seg k-1's
 # last frame). Stage 8 only emits segment boundaries + narration chunks.
 
-SEEDANCE_MIN_S = 2.0
+SEEDANCE_MIN_S = 4.0   # seedance-2.0 supported_durations = [4..15]; 2-3s is rejected
 SEEDANCE_MAX_S = 15.0
 _SNIPPET_RADIUS = 10
 
@@ -415,6 +416,8 @@ def _build_cut_plan(clip):
 def _build_split_message(plans):
     system = (
         "你的任务是为视频片段的旁白选择最自然的语义切分点。"
+        "这些片段由 seedance 生成，seedance 有一条硬性限制：切分后【每一段的时长都必须在 4 到 15 秒之间】"
+        "（少于 4 秒的片段无法生成）。所给的候选位置都已保证落在合法区间内，你只需在其中挑最自然的即可。"
         "你会看到每个片段需要做的若干处切分，每处给出几个候选位置"
         "（每个候选显示切分处前后的文字和时间戳）。"
         "请为每处切分选择语义上最自然的候选——优先句末（。！？）或分句末（，；、），"

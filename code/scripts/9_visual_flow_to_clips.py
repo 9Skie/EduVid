@@ -22,6 +22,7 @@ Usage (run from code/ with venv activated):
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -60,6 +61,11 @@ RENDER_TIMEOUT = 180
 FPS = 24
 RESOLUTION_W = 1280
 RESOLUTION_H = 720
+# A code clip is accepted if its render lands within this of the target, then
+# frame-snapped to EXACTLY round(dur*FPS) frames. Wider than half a frame so
+# manim's per-animation frame rounding (a frame or two off) passes on round 0
+# instead of burning the fix loop; off by more than this is a real timing bug.
+SNAP_WINDOW_S = 0.5
 
 # ── I/O helpers ───────────────────────────────────────────────────────
 
@@ -406,6 +412,16 @@ def apply_edits(code, edits):
     return code, applied
 
 
+def sanitize_manim_code(code):
+    """Strip any LLM-added manim config override. The pipeline fixes the fps via
+    the render command's --fps; a stray `config.frame_rate=` in the script fights
+    it and intermittently yields 25fps. Drops every `config.<attr> =` assignment
+    (resolution/fps are the pipeline's job); a now-unused config import is inert."""
+    kept = [ln for ln in code.splitlines()
+            if not re.match(r"\s*config\.\w+\s*=", ln)]
+    return "\n".join(kept)
+
+
 # ── Skill picking ─────────────────────────────────────────────────────
 
 
@@ -741,7 +757,10 @@ def _submit_seedance_segment(
         print(f"Error: {cfg['api_key_env']} not set", file=sys.stderr)
         return None, "No OpenRouter API key"
 
-    duration = max(2, min(int(round(segment_duration_sec)), 15))
+    # seedance-2.0 supported_durations = [4..15]; requesting 2-3s is rejected.
+    # ceil (overshoot) so the raw clip is always >= target; render_seedance then
+    # cuts the segment down to its exact frame count after download.
+    duration = max(4, min(math.ceil(segment_duration_sec), 15))
 
     cast_imgs = [img for cid in clip.get("cast_ids", []) for img in find_cast_images(cid)]
     if cast_imgs:
@@ -955,7 +974,12 @@ def render_seedance(clip, workspace, client, prompt_cfg, kimi_cfg, prev_last_fra
         if not video:
             return None, f"Segment {i + 1} failed: {error}"
 
+        # The request was overshot (ceil); cut this segment to its EXACT target
+        # frame count with a re-encode — frame-accurate, unlike -c copy. Because
+        # we overshot, this only ever trims (real motion), never freeze-pads.
+        frame_snap(video, max(1, round(seg_duration * FPS)), video)
         segment_paths.append(video)
+        # seed the next segment from the CUT boundary, not the overshot tail
         prev_frame = extract_last_frame_b64(video)
 
     if not segment_paths:
@@ -1025,6 +1049,32 @@ def trim_to_duration(input_path, target_duration, output_path):
         ],
         capture_output=True,
         timeout=60,
+    )
+    if in_place and dest.exists():
+        dest.replace(output_path)
+
+
+def frame_snap(input_path, target_frames, output_path):
+    """Force a rendered clip to EXACTLY target_frames at FPS. Clone-pads the
+    tail then caps at target_frames, so one path both trims (long) and freeze-
+    pads (short). `-frames:v` short-circuits the filter, so the long pad is only
+    generated as far as needed. Re-encodes — frame-accurate, unlike -c copy.
+    Also forces FPS, so a stray non-24fps render can't slip through."""
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    in_place = input_path.resolve() == output_path.resolve()
+    dest = output_path.with_suffix(".snap.mp4") if in_place else output_path
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-vf", "tpad=stop_mode=clone:stop_duration=60",
+            "-frames:v", str(target_frames),
+            "-r", str(FPS),
+            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+            str(dest),
+        ],
+        capture_output=True,
+        timeout=120,
     )
     if in_place and dest.exists():
         dest.replace(output_path)
@@ -1135,6 +1185,8 @@ def process_code_clip(client, prompt_cfg, kimi_cfg, clip, clips, backend, chapte
         # Write code
         lang = "python" if backend == "manim" else "typescript"
         ext = ".py" if backend == "manim" else ".tsx"
+        if backend == "manim":
+            code = sanitize_manim_code(code)  # kill LLM-added config.frame_rate
         code_file = workspace / f"{cid_safe}_v{round_num}{ext}"
         code_file.write_text(code, encoding="utf-8")
 
@@ -1174,26 +1226,39 @@ def process_code_clip(client, prompt_cfg, kimi_cfg, clip, clips, backend, chapte
             error = "ffprobe could not read duration"
             continue
 
-        if abs(actual - duration) < (0.5 / FPS):
-            # Exact match — success
+        # Frame-snap acceptance. Manim quantizes each animation to whole frames,
+        # so the total lands a frame or two off a non-frame-aligned target.
+        # Rather than fail and burn the fix loop chasing a sub-frame-exact
+        # duration the LLM can't hit, accept anything within SNAP_WINDOW_S and
+        # force it to EXACTLY target_frames (trim if long, freeze-pad if short).
+        target_frames = max(1, round(duration * FPS))
+        if abs(actual - duration) <= SNAP_WINDOW_S:
             final = workspace / "clip.mp4"
-            if video != final:
-                import shutil
+            if abs(actual - duration) < (0.5 / FPS):
+                # already frame-exact (remotion always; lucky manim) — no re-encode
+                if video != final:
+                    import shutil
 
-                shutil.copy2(str(video), str(final))
-            print(f"  ✓ Clip {clip_id} OK (round {round_num + 1}, {actual:.2f}s)", file=sys.stderr)
+                    shutil.copy2(str(video), str(final))
+                snapped = actual
+            else:
+                # off by a frame or two (typical manim) — snap to exact frames
+                frame_snap(video, target_frames, final)
+                snapped = ffprobe_duration(final) or (target_frames / FPS)
+            print(f"  ✓ Clip {clip_id} OK (round {round_num + 1}, "
+                  f"{actual:.2f}s → {target_frames}f/{snapped:.2f}s)", file=sys.stderr)
             return {
                 "clip_id": clip_id,
                 "method": backend,
                 "status": "ok",
                 "rounds_used": round_num + 1,
                 "final_path": str(final),
-                "actual_duration": round(actual, 3),
+                "actual_duration": round(snapped, 3),
                 "target_duration": duration,
                 "skills_picked": picked_rules,
             }
 
-        error = f"Duration mismatch: got {actual:.3f}s, need exactly {duration}s"
+        error = f"Duration off by {actual - duration:+.2f}s (got {actual:.2f}s, need {duration:.2f}s)"
 
     # All rounds exhausted — recover from best attempt
     print(f"  ✗ Clip {clip_id} failed after {MAX_ROUNDS} rounds", file=sys.stderr)
@@ -1201,14 +1266,10 @@ def process_code_clip(client, prompt_cfg, kimi_cfg, clip, clips, backend, chapte
 
     if last_video and last_video.exists():
         actual = ffprobe_duration(last_video) or duration
-        if actual > duration:
-            trim_to_duration(last_video, duration, final)
-            status = "trimmed"
-        else:
-            import shutil
-
-            shutil.copy2(str(last_video), str(final))
-            status = "short"
+        # Snap the best attempt to exact length regardless of over/under, so the
+        # clip never injects a gap at assembly. Label reflects long vs short.
+        frame_snap(last_video, max(1, round(duration * FPS)), final)
+        status = "trimmed" if actual > duration else "short"
         print(f"  → recovered as {status} ({actual:.2f}s → {duration}s)", file=sys.stderr)
     else:
         write_black_video(duration, final)
@@ -1236,11 +1297,15 @@ def llm_generate(client, prompt_cfg, kimi_cfg, clip, clips, skill_content, backe
     template = prompt_cfg[key]
     chapter_ctx = build_chapter_context(clips, clip["clip_id"])
 
+    duration = clip_target_duration(clip)
+    duration_frames = max(1, round(duration * FPS))
     task = template["task"].format(
         chapter_context=chapter_ctx,
         clip_id=clip["clip_id"],
         implementation=clip.get("description", ""),
-        duration=clip_target_duration(clip),
+        duration=duration,
+        duration_frames=duration_frames,
+        fps=FPS,
         beats=format_beats(clip.get("_rel_beats", [])),
         char_timings=format_char_timings(clip.get("_rel_char_timings", [])),
         skills=skill_content,
@@ -1263,11 +1328,15 @@ def llm_fix(client, prompt_cfg, kimi_cfg, clip, clips, code, error, skill_conten
     template = prompt_cfg[key]
     chapter_ctx = build_chapter_context(clips, clip["clip_id"])
 
+    duration = clip_target_duration(clip)
+    duration_frames = max(1, round(duration * FPS))
     task = template["task"].format(
         chapter_context=chapter_ctx,
         clip_id=clip["clip_id"],
         implementation=clip.get("description", ""),
-        duration=clip_target_duration(clip),
+        duration=duration,
+        duration_frames=duration_frames,
+        fps=FPS,
         beats=format_beats(clip.get("_rel_beats", [])),
         code=code,
         error=error,
@@ -1362,12 +1431,10 @@ def main():
                     prev_seedance_last_frame = extract_last_frame_b64(video)
                     prev_was_seedance = True
                     prev_cast_ids = clip.get("cast_ids", [])
-                    actual = ffprobe_duration(video) or clip_target_duration(clip)
+                    # render_seedance cut each segment to its exact frame count,
+                    # so the clip is already at target — no imprecise -c copy trim.
                     target = clip_target_duration(clip)
-                    # Trim if too long
-                    if actual > target:
-                        trim_to_duration(video, target, video)
-                        actual = target
+                    actual = ffprobe_duration(video) or target
                     results.append(
                         {
                             "clip_id": clip_id,
