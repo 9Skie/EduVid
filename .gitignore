@@ -10,11 +10,16 @@ code/.env
 .DS_Store
 
 # Inputs (copyrighted textbooks) and final outputs
-code/dataset/
+code/tools/dataset/
 code/out/
 
 # Large outputs and reference materials
 code/tmp/
-code/remotion_project/
-ref/
+code/tools/remotion/
+code/tools/skills/
 logs/
+
+# Per-project run artifacts (not tracked; project.json + book.json ARE tracked)
+code/projects/**/tmp/
+code/projects/**/out/
+code/projects/**/casts/
