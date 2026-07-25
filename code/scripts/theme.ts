@@ -1,57 +1,63 @@
-// theme.ts — frozen Remotion style tokens. Generated code composes from the styled
-// components below, never raw divs with ad-hoc CSS.
-
-export const COLORS = {
-  primary:   "#2D5BFF",
-  accent:    "#FF8A3D",
-  highlight: "#FFD23F",
-  correct:   "#34C759",
-  error:     "#FF3B30",
-  neutral:   "#8E8E93",
-  bg:        "#0E1116",
-  fg:        "#F2F2F7",
-};
-
-export const FONT = "Inter";
-export const TYPE = { title: 72, body: 40, label: 30, small: 24 };  // px
-export const SPACE = { unit: 16, safeMargin: 64 };                  // px
-export const MOTION = { enterFrames: 18, emphasisFrames: 12 };      // at 30fps
-
-// ── Base components (generated compositions use these, not bare JSX) ──
-import { interpolate, useCurrentFrame } from "remotion";
-import React from "react";
-
-export const Title: React.FC<{children: React.ReactNode}> = ({children}) => (
-  <div style={{ fontFamily: FONT, fontSize: TYPE.title, fontWeight: 700,
-                color: COLORS.fg, position: "absolute", top: SPACE.safeMargin,
-                left: SPACE.safeMargin }}>{children}</div>
-);
-
-export const Body: React.FC<{children: React.ReactNode}> = ({children}) => (
-  <div style={{ fontFamily: FONT, fontSize: TYPE.body, color: COLORS.fg }}>{children}</div>
-);
-
-export const Label: React.FC<{children: React.ReactNode}> = ({children}) => (
-  <div style={{ fontFamily: FONT, fontSize: TYPE.label, color: COLORS.neutral }}>{children}</div>
-);
-
-export const Card: React.FC<{children: React.ReactNode}> = ({children}) => (
-  <div style={{ background: "#161B22", borderRadius: 16, padding: SPACE.unit * 2,
-                margin: SPACE.unit, color: COLORS.fg }}>{children}</div>
-);
-
-// standard entrance — fade + slide, used everywhere for a consistent reveal
-export const FadeUp: React.FC<{children: React.ReactNode}> = ({children}) => {
-  const frame = useCurrentFrame();
-  const opacity = interpolate(frame, [0, MOTION.enterFrames], [0, 1], { extrapolateRight: "clamp" });
-  const y = interpolate(frame, [0, MOTION.enterFrames], [12, 0], { extrapolateRight: "clamp" });
-  return <div style={{ opacity, transform: `translateY(${y}px)` }}>{children}</div>;
-};
-
-// ── Themed background wrapper ────────────────────────────────────────
-// Every composition's root wraps its content in <ThemedBackground> so the
-// dark navy background is guaranteed without the LLM needing to set it.
-export const ThemedBackground: React.FC<{children: React.ReactNode}> = ({children}) => (
-  <div style={{ background: COLORS.bg, width: "100%", height: "100%",
-                position: "absolute", top: 0, left: 0 }}>{children}</div>
-);
+// Frozen EduVid motion theme. 3_clips.py injects THEME_CSS into every motion
+// clip HTML wrapper. The LLM does not redefine these values.
+export const THEME_CSS = `
+:root {
+  --bg: #0E1116;
+  --fg: #F2F2F7;
+  --primary: #2D5BFF;
+  --accent: #FF8A3D;
+  --highlight: #FFD23F;
+  --correct: #34C759;
+  --error: #FF3B30;
+  --neutral: #8E8E93;
+  --card: #161B22;
+  --font: Inter, -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --type-title: 54px;
+  --type-body: 36px;
+  --type-label: 28px;
+  --type-small: 22px;
+  --space-unit: 16px;
+  --safe-margin: 64px;
+  --radius: 16px;
+  --motion-enter: 600ms;
+  --motion-emphasis: 400ms;
+  --ease: cubic-bezier(.2,.8,.2,1);
+}
+html, body {
+  margin: 0;
+  width: 1280px;
+  height: 720px;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+}
+#stage {
+  position: relative;
+  width: 1280px;
+  height: 720px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.edu-title { font-size: var(--type-title); font-weight: 700; color: var(--fg); }
+.edu-body { font-size: var(--type-body); color: var(--fg); }
+.edu-label { font-size: var(--type-label); color: var(--neutral); }
+.edu-small { font-size: var(--type-small); color: var(--neutral); }
+.edu-card {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: calc(var(--space-unit) * 2);
+  color: var(--fg);
+}
+.edu-enter { animation: eduFadeUp var(--motion-enter) var(--ease) both; }
+.edu-emphasis { animation: eduPulse var(--motion-emphasis) var(--ease) both; }
+@keyframes eduFadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes eduPulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.04); }
+  100% { transform: scale(1); }
+}
+`;

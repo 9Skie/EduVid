@@ -1,0 +1,53 @@
+{
+  "route": {
+    "routing": "每个 clip 二选一：seedance 或 motion_graphics。要呈现真实世界、人物、地点、动作、氛围、历史或现实场景，用 seedance；要呈现设计出来的信息、文字、术语、公式、图形、关系、流程、版面，或需要精确时间控制的画面，用 motion_graphics。确切文字、数字、公式、标签不要交给 seedance。成片静音：旁白后期合成，seedance 也不生成声音，所以信息不能依赖任何声音传达，关键文字必须做进画面。\n\nDefault available setting: classroom（默认地点）、teacher（不说话的引导者，绝不对镜头念稿）、students（同龄反应者：倾听、思考、点头、回应）始终可用。需要人物/教室画面时优先使用它们，但不要强行塞进每个 clip。",
+    "task": "以下是本章带时间戳的逐行旁白、逐字时间和可用 cast。请切分 clip、选择方法、写 summary。不要写详细画面指令。\n\n带时间戳与逐字时间的脚本：\n{timed_script}\n\n本章可用 cast：\n{cast_set}",
+    "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。\n\n{\"clips\": [{\"clip_id\": \"c1_clip_001 这类 id\", \"line_ids\": [\"连续覆盖的 line_id\"], \"method\": \"seedance | motion_graphics\", \"cast_ids\": [\"真正出现在画面里的 cast_id，可空\"], \"summary\": \"这个 clip 的视觉大意\"}]}",
+    "constraints": [
+      "line_ids 必须连续，按顺序覆盖本章节全部行，不重叠、不留空",
+      "method 只能是 seedance 或 motion_graphics",
+      "cast_ids 只能取自输入 cast，不要编造；泛指群众、路人、动物不要填",
+      "clip 的 start_ms/end_ms/duration_ms 由代码从 line_ids 推出，你不要输出 clip 时间",
+      "成片静音，关键信息必须能靠画面传达",
+      "同一章内反复出现的对象、概念、符号要保持相同视觉表示；所有 clip 共同服务一条教学叙事线，不各自为政",
+      "输出纯 JSON，不要 markdown 代码块标记或额外文字"
+    ]
+  },
+  "seedance_describe": {
+    "rules": "为一个 seedance clip 写画面计划。先定这个镜头的一个意图：它要让学生看见或理解什么；主体、动作、镜头、光位都服务这个意图。输出 storyboard_plan 和 directives。storyboard_plan 是按顺序的分镜列表：每个镜头写主体、环境、动作、构图、镜头感、光位气氛；只写可见内容，不写 电影感/氛围感/高级感 这类空话，把感觉拆成材质、光线、色彩、空气和动作。directives 是带 clip 相对时间窗的近似运镜/节奏意图，用来推动生成，但 seedance 不能逐帧保证；时间窗在 [0, duration_ms] 内、按顺序不重叠即可，不需要铺满。镜头语言遵守一个主镜头原则：一个镜头一个主要景别和一个主要运动，给起点和终点，不要堆叠推镜+横移+手持+环绕。动作写 actor/object、动作、力度、时间、物理后果和终点；光写真实来源、方向、色温、阴影/反射和是否变化。多人画面遵守：非焦点人物只做持续微动作（呼吸、眨眼、轻微肩部/目光移动），最多一个人有一个小反应，大动作默认禁止，除非是镜头唯一节拍；手和脸脆弱，接触道具要简单。具名角色用 cast_id 稳定指代，不要写含糊代词。参考图只负责身份、首帧、故事板、环境或风格中的一种角色，并说明什么不迁移。成片静音：人物可以自然表演、互相说话，但信息不能依赖声音或口型；不要让角色正对镜头像主播一样念稿。确切文字、数字、公式、标签不要依赖 seedance 生成。若长镜头被拆段，后段承接前段已接受的结尾状态：同一主体、同一场景状态、同一镜头方向，不重启；已发生的节拍不重演，未来节拍不提前泄露。\n\n若一个真实教学/演示 clip 没有更具体的地点或角色，默认使用 classroom 作为场景，teacher/students 作为自然背景存在；成片静音，人物可以自然动作和互相交流，但任何人不得正对镜头念稿。",
+    "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。\n\n{\"storyboard_plan\": [{\"shot\": \"这一镜头的画面内容、构图、主体动作\"}], \"directives\": [{\"t_ms\": [相对开始毫秒, 相对结束毫秒], \"action\": \"近似运镜/节奏意图\"}]}",
+    "constraints": [
+      "所有 t_ms 都是 clip 相对毫秒，落在 [0, duration_ms] 内",
+      "directives 是近似意图，不重叠即可，不用铺满；不要承诺逐帧精确",
+      "storyboard_plan 只写可见内容，不写空洞风格词；感觉必须拆成材质/光线/色彩/空气/动作",
+      "多人画面默认只做微动作，最多一个小反应，不写混乱大动作",
+      "成片静音，不写任何依赖声音或口型的设计；不让角色正对镜头念稿",
+      "同一章内反复出现的对象、概念、符号要保持相同视觉表示；与前后 clip 衔接，不各自为政",
+      "确切文字/符号/公式/标签不要依赖 seedance 生成",
+      "输出纯 JSON，不要 markdown 代码块标记或额外文字"
+    ]
+  },
+  "motion_describe": {
+    "rules": "为一个 motion_graphics clip 写精确 keyframe_plan。所有时间都是 clip 相对毫秒：从 0 开始，到 duration_ms 结束。keyframe_plan 每项带相对时间窗 [开始毫秒, 结束毫秒]，必须首尾相接、不重叠、不留空，精确覆盖 [0, duration_ms]；第一个从 0 开始，最后一个到 duration_ms 结束；画面不变的时段也写成一个“保持”窗口。每项 action 具体写观众看到什么：对象、位置、入场/高亮/出场、保持内容；同一段时间内可以同时发生多件事。要显示的确切文字、符号、公式、标签一字不差写进 action。不要写工具代码，不要指定整体美术风格、配色、字体。",
+    "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。\n\n{\"keyframe_plan\": [{\"t_ms\": [相对开始毫秒, 相对结束毫秒], \"action\": \"这一窗口画面上精确发生什么\"}]}",
+    "constraints": [
+      "所有 t_ms 都是 clip 相对毫秒，落在 [0, duration_ms] 内",
+      "keyframe_plan 必须 gapless 精确覆盖 [0, duration_ms]",
+      "确切文字/符号/公式/标签要一字不差写进 action",
+      "成片静音，不要写任何依赖声音的设计",
+      "同一章内反复出现的对象、概念、符号要保持相同视觉表示；与前后 clip 衔接，不各自为政",
+      "输出纯 JSON，不要 markdown 代码块标记或额外文字"
+    ]
+  },
+  "motion_generate": {
+    "html_rules": "冻结主题由 3_clips.py 从 scripts/theme.ts 注入到每个 motion clip 的 HTML wrapper。你只写 #stage 内部的场景内容和可选 window.renderAt(ms) 动画逻辑，不要写 <html>/<head>/<body>/<style>，不要重新定义颜色、字体、字号、间距、背景或 CSS variables，不要引用任何外部资源、CDN、字体或图片。舞台固定 1280x720，背景不透明。动画必须严格按 keyframe_plan 的相对时间窗执行：每个窗口的动作在它的 t_ms 区间内发生，总时长 duration_ms，播完停在最后一帧。绝对静音：不使用任何 Audio、语音或提示音。要显示的文字、符号、公式、标签与 keyframe_plan 一字不差；排版清晰、对比度高、中文不溢出。",
+    "task": "clip 视觉大意：{summary}\n总时长：{duration_ms}ms\n\nkeyframe_plan：\n{keyframe_plan}\n\n请只输出 #stage 内部内容（可含 <script> 定义 window.renderAt(ms)），不要完整 html 文档，不要解释。",
+    "constraints": [
+      "只输出 #stage 内部内容，不要 <html>/<head>/<body>/<style>，不要 markdown 代码块标记",
+      "冻结主题已注入；不要重新定义颜色、字体、字号、间距、背景或 CSS variables",
+      "不引用任何外部资源，不发出任何声音",
+      "时间轴严格按 keyframe_plan 的相对时间窗，播完停在最后一帧",
+      "确切文字/符号/公式/标签与 keyframe_plan 一字不差"
+    ]
+  }
+}

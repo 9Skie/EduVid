@@ -3,15 +3,15 @@
   "is_anchor": true,
   "name": "老师",
   "kind": "character",
-  "bucket": "fixed",
-  "origin": "real",
-  "speaks": false,
-  "description": "一位成年中国男教师，约三十多岁，亲切、有耐心、有权威感的神情，得体的日常教师着装。",
-  "reference_images": [
-    "casts/fixed/images/character_teacher_example.jpg",
-    "casts/fixed/images/character_teacher_design.jpg"
-  ],
-  "presence": "画面中的主讲老师形象，按需出现（与 consistent 角色一样，由分镜环节决定是否入镜），从不说话——讲解均为旁白；入镜时只做引导性的手势、点头与表情。",
-  "age_rule": "固定为成年教师形象，不随年级变化；以老师提供的真实照片为锚定生成风格化形象（origin: real）。",
-  "_note": "description 与 reference_images 由阶段 5 的 anchor 生成步骤按年级/照片填充并覆盖。"
+  "description": "成年教师形象，亲切、有耐心、有权威感，得体的日常教师着装。",
+  "presence": "非说话引导者；可做手势、点头、表情引导；绝不对镜头念稿。",
+  "regen": {
+    "teacher_photo_path_from": "teacher_job.teacher_photo_path",
+    "base_example": "tools/casts_fixed/images/character_teacher_example.jpg",
+    "base_design": "tools/casts_fixed/images/character_teacher_design.jpg",
+    "example_prompt": "以真实教师照片和教师 example 为参考，生成统一美术风格下的教师 stylized example：保留真实 likeness，成年、亲切、有权威感。",
+    "design_prompt": "以教师 stylized example 和教师 design 参考图生成最终 design sheet：同一人物、同一风格、清晰展示外貌、年龄、服饰和标志性细节。",
+    "output_example": "character_teacher_example.jpg",
+    "output_design": "character_teacher_design.jpg"
+  }
 }

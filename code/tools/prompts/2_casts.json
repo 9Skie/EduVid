@@ -1,0 +1,16 @@
+{
+  "extract": {
+    "task": "通读教学视频脚本全文，找出值得生成视觉参考图的实体，只登记不描述。标准：必须是具体、唯一、可辨认的真实人物或真实地标；两个读者读到它会想到同一个明确形象。应提取如秦始皇、欧几里得、长城、赵州桥、埃菲尔铁塔这类实体；不要提取泛指人群、未具名地点或普通物体。对每个实体登记 cast_id（英文蛇形）、name（最通用、最可能查到维基的中文名）、kind（character/location）、bucket（consistent 或 chapter_N）。bucket 规则：只要超过1个板块出现或提及，一律 consistent；真正只在一个板块出现才标 chapter_N。不要登记老师、小明、小红。",
+    "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。\n\n{\"roster\": [{\"cast_id\": \"英文蛇形命名\", \"name\": \"中文名称\", \"kind\": \"character | location\", \"bucket\": \"consistent | chapter_1 | chapter_2 | ...\"}]}"
+  },
+  "describe": {
+    "task": "根据完整名册、各实体的真实参考图（如有）和脚本语境，为每个实体写一张中文视觉描述卡，供 GPT Image 2 生成统一风格参考图。有参考图就依据真实可辨认特征写；没有参考图就凭知识写。所有图最终是统一 3D 动画美术风格，所以不要写美术风格，只写实体本身。关键要求是所有实体放在一起一次性描述，必须明显区分同类型/同时代实体：人物写清年龄、体格、脸型、发型胡须、服饰颜色样式、时代标志；地点写清结构、材质、风格、年代、标志特征和环境。",
+    "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。只需输出 cast_id 和 description，其余字段由程序从名册合并：\n\n{\"casts\": [{\"cast_id\": \"...\", \"description\": \"详细的中文视觉描述，依据真实参考图来写，突出与其他实体的区分特征\"}]}"
+  },
+  "cast_contract": {
+    "source_rule": "Real-entity reference images come from Wikipedia API only. If no usable Wikipedia image is found, continue and mark real_image_found=false.",
+    "anchor_rule": "Fixed anchors are loaded from tools/casts_fixed, merged into cast_set.json, and not regenerated.",
+    "cast_rule": "Extract recurring, specific, identifiable real people and locations only. Do not extract generic people/places. No hard cap, but do not invent cast.",
+    "output": "projects/<project_id>/casts/cast_set.json plus generated images under projects/<project_id>/casts/images/."
+  }
+}

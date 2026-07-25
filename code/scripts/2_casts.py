@@ -5,7 +5,7 @@ Step 2: cast establishment.
 Input:
   projects/<project_id>/script_final.json
   projects/<project_id>/context_pack.json   # currently unused except for future context
-  tools/casts_fixed/*.json                  # anchors, referenced not regenerated
+  tools/casts_fixed/*.json                  # anchor regeneration specs
   tools/prompts/2_casts.json
   tools/prompts/art_style.json              # optional
 
@@ -20,7 +20,7 @@ Rules:
   - real-entity reference images come from Wikipedia API only;
   - if no usable Wikipedia image is found, continue and mark real_image_found=false;
   - no hard cast cap, but only recurring specific identifiable people/locations;
-  - fixed anchors are merged in and referenced from tools/casts_fixed/images.
+  - teacher/students/classroom anchors are regenerated per project before roster extraction.
 
 Usage (run from code/ with venv activated):
     source .venv/bin/activate
@@ -34,14 +34,16 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
@@ -52,9 +54,43 @@ WIKI_THUMB_SIZE = 500
 IMAGE_MAX_EDGE = 1024
 OPENROUTER_IMAGE_API = "https://openrouter.ai/api/v1/images"
 IMAGE_MODEL = "openai/gpt-image-2"
-ANCHOR_IDS = {"teacher", "xiaoming", "xiaohong"}
-ANCHOR_NAMES = {"老师", "小明", "小红"}
+ANCHOR_IDS = {"teacher", "xiaoming", "xiaohong", "classroom"}
+ANCHOR_NAMES = {"老师", "小明", "小红", "教室"}
 MAX_WORKERS = 8  # concurrent wiki fetches / image generations in phases 2 and 4
+
+_TRACE_DIR = None
+_TRACE_LOCK = threading.Lock()
+
+
+def set_trace_dir(path):
+    """Enable per-call LLM tracing to <path>/llm_trace.jsonl (thread-safe append)."""
+    global _TRACE_DIR
+    _TRACE_DIR = Path(path)
+    _TRACE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _sanitize_messages(messages):
+    """Copy messages with image payloads stripped (base64 data URLs are huge)."""
+    cleaned = []
+    for m in messages:
+        m = dict(m)
+        content = m.get("content")
+        if isinstance(content, list):
+            m["content"] = [
+                {"type": "image_url", "image_url": "[omitted]"} if isinstance(p, dict) and p.get("type") == "image_url" else p
+                for p in content
+            ]
+        cleaned.append(m)
+    return cleaned
+
+
+def trace_call(record):
+    if _TRACE_DIR is None:
+        return
+    line = json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **record}, ensure_ascii=False)
+    with _TRACE_LOCK:
+        with open(_TRACE_DIR / "llm_trace.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def load_json(path):
@@ -98,7 +134,7 @@ def build_chapter_list(chapters):
     return "\n".join(lines)
 
 
-def stream_llm_content(client, messages, model):
+def stream_llm_content(client, messages, model, label=""):
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -107,6 +143,7 @@ def stream_llm_content(client, messages, model):
         response_format={"type": "json_object"},
     )
     thinking = False
+    thinking_parts = []
     parts = []
     for chunk in stream:
         if not chunk.choices:
@@ -118,6 +155,7 @@ def stream_llm_content(client, messages, model):
                 thinking = True
                 print("\n--- thinking ---", file=sys.stderr)
             print(reasoning, end="", flush=True, file=sys.stderr)
+            thinking_parts.append(reasoning)
         if delta.content:
             if thinking:
                 thinking = False
@@ -125,13 +163,24 @@ def stream_llm_content(client, messages, model):
             print(delta.content, end="", flush=True)
             parts.append(delta.content)
     print(file=sys.stderr)
-    return "".join(parts)
+    content = "".join(parts)
+    trace_call(
+        {
+            "kind": "llm_call",
+            "label": label,
+            "model": model,
+            "messages": _sanitize_messages(messages),
+            "reasoning": "".join(thinking_parts),
+            "output": content,
+        }
+    )
+    return content
 
 
 def call_llm_json(client, messages, model, validate_fn, label):
     last_errors = ["not called"]
     for attempt in range(1, 3):
-        raw = stream_llm_content(client, messages, model)
+        raw = stream_llm_content(client, messages, model, label=f"{label} attempt {attempt}")
         messages.append({"role": "assistant", "content": raw})
         try:
             parsed = json.loads(raw)
@@ -176,8 +225,9 @@ def resize_longest_edge(img, max_edge):
 
 
 def save_jpg(img, out_path, max_edge=IMAGE_MAX_EDGE):
+    """Save every generated/reference image as exact 1280x720, 100 DPI."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img = resize_longest_edge(img.convert("RGB"), max_edge)
+    img = ImageOps.fit(img.convert("RGB"), (1280, 720), Image.LANCZOS, centering=(0.5, 0.5))
     img.save(out_path, format="JPEG", quality=90, dpi=(100, 100))
 
 
@@ -239,7 +289,7 @@ def fetch_wiki_image(name, out_path):
     return {"real_image_found": True, "source": info, "wiki_image": out_path.name}
 
 
-def call_image_api(api_key, prompt, input_references=None):
+def call_image_api(api_key, prompt, input_references=None, label=""):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": IMAGE_MODEL,
@@ -260,6 +310,7 @@ def call_image_api(api_key, prompt, input_references=None):
                 raise RuntimeError(f"No image returned: {result}")
             cost = result.get("usage", {}).get("cost", "?")
             print(f"    Cost: ${cost}", file=sys.stderr)
+            trace_call({"kind": "image_call", "label": label, "model": IMAGE_MODEL, "prompt": prompt, "n_refs": len(input_references or []), "cost": cost})
             return base64.b64decode(result["data"][0]["b64_json"])
         except Exception as e:  # noqa: BLE001
             resp = getattr(e, "response", None)
@@ -364,13 +415,11 @@ def validate_cast_set(cast_set, code_dir):
         seen.add(cast_id)
         if item.get("is_anchor"):
             anchor_count += 1
-        for key in ("name", "kind", "origin", "description", "reference_images"):
+        for key in ("name", "kind", "description", "reference_images"):
             if key not in item:
                 errors.append(f"{cast_id} missing {key}")
         if item.get("kind") not in ("character", "location"):
             errors.append(f"{cast_id} kind must be character or location")
-        if item.get("origin") not in ("real", "fictional"):
-            errors.append(f"{cast_id} origin must be real or fictional")
         refs = item.get("reference_images") or []
         if not isinstance(refs, list) or not refs:
             errors.append(f"{cast_id} reference_images must be a non-empty list")
@@ -380,20 +429,113 @@ def validate_cast_set(cast_set, code_dir):
                 errors.append(f"{cast_id} reference image not found: {ref}")
     if anchor_count == 0:
         errors.append("cast_set needs at least one fixed anchor")
+    required = {"teacher", "classroom"}
+    missing_required = required - seen
+    if missing_required:
+        errors.append(f"cast_set missing required anchors: {sorted(missing_required)}")
+    if not ({"xiaoming", "xiaohong"} & seen):
+        errors.append("cast_set needs at least one student anchor (xiaoming or xiaohong)")
     return errors
 
 
-def load_anchors(code_dir):
-    anchors = []
-    for path in sorted((code_dir / "tools" / "casts_fixed").glob("*.json")):
-        record = load_json(path)
-        refs = []
-        for ref in record.get("reference_images", []) or []:
-            refs.append(f"tools/casts_fixed/images/{Path(ref).name}")
-        record["reference_images"] = refs
-        record["is_anchor"] = True
-        anchors.append(record)
-    return anchors
+def load_teacher_job(code_dir):
+    return load_json(code_dir / "tools" / "prompts" / "1_preproduction.json")["teacher_job"]
+
+
+def _image_refs(paths):
+    return [{"type": "image_url", "image_url": {"url": image_to_data_url(p)}} for p in paths if p and Path(p).exists()]
+
+
+def regenerate_anchors(code_dir, project_dir, art_style, openrouter_key):
+    if not openrouter_key:
+        raise RuntimeError("OPENROUTER_API_KEY not set; anchors must be regenerated")
+
+    specs_dir = code_dir / "tools" / "casts_fixed"
+    casts_dir = project_dir / "casts"
+    images_dir = casts_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    job = load_teacher_job(code_dir)
+    grade_level = int(job.get("grade_level", 8))
+
+    # Each chain is independent; the two steps WITHIN a chain are dependent
+    # (example -> design) and stay sequential. Chains run in parallel.
+
+    def teacher_chain():
+        # Teacher: real photo + example -> stylized example; stylized example + design -> design.
+        teacher_spec = load_json(specs_dir / "teacher.json")
+        regen = teacher_spec["regen"]
+        base_example = code_dir / regen["base_example"]
+        base_design = code_dir / regen["base_design"]
+        photo_path = job.get("teacher_photo_path", "")
+        teacher_photo = code_dir / photo_path if photo_path else None
+        teacher_photo_used = bool(teacher_photo and teacher_photo.exists())
+
+        example_out = images_dir / regen["output_example"]
+        design_out = images_dir / regen["output_design"]
+        step1_refs = [teacher_photo if teacher_photo_used else base_example, base_example]
+        image_bytes = call_image_api(openrouter_key, regen["example_prompt"], input_references=_image_refs(step1_refs), label="anchor teacher example")
+        save_jpg(Image.open(io.BytesIO(image_bytes)), example_out)
+        image_bytes = call_image_api(openrouter_key, regen["design_prompt"], input_references=_image_refs([example_out, base_design]), label="anchor teacher design")
+        save_jpg(Image.open(io.BytesIO(image_bytes)), design_out)
+        return {
+            "cast_id": teacher_spec["cast_id"],
+            "is_anchor": True,
+            "name": teacher_spec["name"],
+            "kind": teacher_spec["kind"],
+            "reference_images": [rel_to_code(example_out, code_dir), rel_to_code(design_out, code_dir)],
+            "description": teacher_spec["description"],
+            "presence": teacher_spec["presence"],
+            "teacher_photo_used": teacher_photo_used,
+        }
+
+    # Students: grade -> age, age + example -> age-changed example, + design -> design.
+    students_spec = load_json(specs_dir / "students.json")
+    age = grade_level + 5
+
+    def student_chain(spec):
+        base_example = code_dir / spec["base_example"]
+        base_design = code_dir / spec["base_design"]
+        example_out = images_dir / students_spec["output_example"].format(cast_id=spec["cast_id"])
+        design_out = images_dir / students_spec["output_design"].format(cast_id=spec["cast_id"])
+        prompt = students_spec["example_prompt"].format(age=age)
+        image_bytes = call_image_api(openrouter_key, prompt, input_references=_image_refs([base_example]), label=f"anchor {spec['cast_id']} example")
+        save_jpg(Image.open(io.BytesIO(image_bytes)), example_out)
+        prompt = students_spec["design_prompt"].format(age=age)
+        image_bytes = call_image_api(openrouter_key, prompt, input_references=_image_refs([example_out, base_design]), label=f"anchor {spec['cast_id']} design")
+        save_jpg(Image.open(io.BytesIO(image_bytes)), design_out)
+        return {
+            "cast_id": spec["cast_id"],
+            "is_anchor": True,
+            "name": spec["name"],
+            "kind": spec["kind"],
+            "reference_images": [rel_to_code(example_out, code_dir), rel_to_code(design_out, code_dir)],
+            "description": f"{spec['description']}（约 {age} 岁）",
+            "presence": spec["presence"],
+            "inferred_age": age,
+        }
+
+    def classroom_chain():
+        # Classroom: base design -> per-project design sheet (same recipe shape as
+        # teacher/students; the base image is the identity reference).
+        classroom_spec = load_json(specs_dir / "classroom.json")
+        regen = classroom_spec["regen"]
+        base_design = code_dir / regen["base_design"]
+        design_out = images_dir / regen["output_design"]
+        prompt = f"{art_style}\n" + regen["prompt"].format(grade_level=grade_level)
+        image_bytes = call_image_api(openrouter_key, prompt, input_references=_image_refs([base_design]), label="anchor classroom design")
+        save_jpg(Image.open(io.BytesIO(image_bytes)), design_out)
+        return {
+            "cast_id": classroom_spec["cast_id"],
+            "is_anchor": True,
+            "name": classroom_spec["name"],
+            "kind": classroom_spec["kind"],
+            "reference_images": [rel_to_code(design_out, code_dir)],
+            "description": classroom_spec["description"],
+        }
+
+    chains = [teacher_chain] + [lambda spec=spec: student_chain(spec) for spec in students_spec["students"]] + [classroom_chain]
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(chains))) as pool:
+        return list(pool.map(lambda chain: chain(), chains))
 
 
 def load_art_style(code_dir):
@@ -416,6 +558,7 @@ def main():
     images_dir = casts_dir / "images"
     casts_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
+    set_trace_dir(project_dir / "logs")
     load_dotenv(code_dir / ".env")
 
     script_path = project_dir / "script_final.json"
@@ -439,6 +582,13 @@ def main():
         print("Error: KIMI_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
     client = OpenAI(api_key=kimi_key, base_url=kimi_base, timeout=600)
+
+    # Phase 0: regenerate teacher/students/classroom anchors for this project.
+    print("\n=== cast phase 0: regenerate anchors ===", file=sys.stderr)
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    art_style = load_art_style(code_dir)
+    anchors = regenerate_anchors(code_dir, project_dir, art_style, openrouter_key)
+    print(f"Anchors regenerated: {[a['cast_id'] for a in anchors]}", file=sys.stderr)
 
     # Phase 1: extract roster
     extract_cfg = prompt["extract"]
@@ -464,7 +614,6 @@ def main():
                 "is_anchor": False,
                 "name": item["name"],
                 "kind": item["kind"],
-                "origin": "real",
                 "appears_in_chapters": bucket_to_chapters(item.get("bucket", "consistent"), chapter_ids),
                 "description": "",
                 "real_image_found": False,
@@ -545,11 +694,9 @@ def main():
 
     # Phase 4: generate frozen reference sheets (parallel; failures abort as before)
     print("\n=== cast phase 4: generate reference sheets ===", file=sys.stderr)
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     if roster and not openrouter_key:
         print("Error: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
-    art_style = load_art_style(code_dir)
 
     def generate_one(entry):
         cast_id = entry["cast_id"]
@@ -565,7 +712,7 @@ def main():
             if wiki_path.exists():
                 refs.append({"type": "image_url", "image_url": {"url": image_to_data_url(wiki_path)}})
         print(f"  [{cast_id}] generating...", file=sys.stderr)
-        image_bytes = call_image_api(openrouter_key, gen_prompt, input_references=refs or None)
+        image_bytes = call_image_api(openrouter_key, gen_prompt, input_references=refs or None, label=f"cast sheet {cast_id}")
         img = Image.open(io.BytesIO(image_bytes))
         out_path = images_dir / f"{entry['kind']}_{cast_id}_generated.jpg"
         save_jpg(img, out_path)
@@ -580,7 +727,7 @@ def main():
 
     cast_set = {
         "project_id": args.project_id,
-        "cast": load_anchors(code_dir) + roster,
+        "cast": anchors + roster,
     }
     errors = validate_cast_set(cast_set, code_dir)
     if errors:

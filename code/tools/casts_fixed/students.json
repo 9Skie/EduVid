@@ -1,0 +1,29 @@
+{
+  "age_rule": "grade_level + 5",
+  "students": [
+    {
+      "cast_id": "xiaoming",
+      "is_anchor": true,
+      "name": "小明",
+      "kind": "character",
+      "description": "中国男学生，整洁日常校园穿着，好奇、外向；与小红明显区分。",
+      "presence": "同龄男学生反应者；倾听、思考、点头、好奇张望；不说话。",
+      "base_example": "tools/casts_fixed/images/character_xiaoming_example.jpg",
+      "base_design": "tools/casts_fixed/images/character_xiaoming_design.jpg"
+    },
+    {
+      "cast_id": "xiaohong",
+      "is_anchor": true,
+      "name": "小红",
+      "kind": "character",
+      "description": "中国女学生，整洁日常校园穿着，细心、专注；与小明明显区分。",
+      "presence": "同龄女学生反应者；倾听、思考、点头、回应；不说话。",
+      "base_example": "tools/casts_fixed/images/character_xiaohong_example.jpg",
+      "base_design": "tools/casts_fixed/images/character_xiaohong_design.jpg"
+    }
+  ],
+  "example_prompt": "根据年级推出年龄 {age} 岁，以学生 example 为参考生成 age-changed example：符合该年龄身形与脸庞，身份保持一致。",
+  "design_prompt": "以 age-changed example、年龄 {age} 岁和 design 参考图生成最终 student design sheet：年龄准确，外观与另一名学生明显区分。",
+  "output_example": "character_{cast_id}_example.jpg",
+  "output_design": "character_{cast_id}_design.jpg"
+}

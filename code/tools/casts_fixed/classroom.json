@@ -1,0 +1,12 @@
+{
+  "cast_id": "classroom",
+  "is_anchor": true,
+  "name": "教室",
+  "kind": "location",
+  "description": "适合当前年级教学视频的中性教室环境，整洁、明亮、可做讲解演示，不抢主体。",
+  "regen": {
+    "base_design": "tools/casts_fixed/images/location_classroom_design.jpg",
+    "prompt": "以教室参考图为基准，生成适合 grade {grade_level} 教学视频的教室地点参考图：保持参考图的美术风格、教室类型与整体氛围，整洁明亮，中性，不抢主体，清晰展示结构、材质与标志性特征。",
+    "output_design": "location_classroom_design.jpg"
+  }
+}
