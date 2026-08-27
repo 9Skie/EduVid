@@ -95,9 +95,15 @@ def read_chapter_inputs(project_dir, chapter_id, voice):
         raise RuntimeError(f"no clips in {manifest_path}")
 
     video_paths = []
+    not_ok = [c for c in clips if c.get("status") != "ok"]
+    if not_ok:
+        detail = ", ".join(f"{c.get('clip_id')}={c.get('status')}" for c in not_ok)
+        raise RuntimeError(
+            f"chapter {chapter_id}: {len(not_ok)}/{len(clips)} clips are not ok ({detail}). "
+            f"Re-run 3_clips.py --chapter {chapter_id} to retry just those; composing now "
+            f"would silently drop them from the video."
+        )
     for item in clips:
-        if item.get("status") != "ok":
-            raise RuntimeError(f"clip {item.get('clip_id')} status is not ok: {item.get('status')}")
         path = Path(item.get("video_file", ""))
         if not path.is_absolute():
             path = project_dir / path
@@ -175,7 +181,24 @@ def compose_chapter(project_dir, chapter_id, voice, out_dir):
     concat_videos(videos, silent)
     mux_audio(silent, audio, final)
     meta = ffprobe(final)
-    return {"chapter": chapter_id, "video": final, "duration_s": meta["duration"], "lines": lines, "audio_ms": chapter_duration_ms(lines)}
+    audio_ms = chapter_duration_ms(lines)
+    video_ms = round(meta["duration"] * 1000)
+    # With frame telescoping in 3_clips.py these should agree to well under a frame.
+    # A larger gap means the clips no longer match the plan that timed them.
+    if audio_ms and abs(video_ms - audio_ms) > 500:
+        print(
+            f"Warning: chapter {chapter_id} video is {video_ms}ms but narration is {audio_ms}ms "
+            f"({video_ms - audio_ms:+d}ms)",
+            file=sys.stderr,
+        )
+    return {
+        "chapter": chapter_id,
+        "video": final,
+        "duration_s": meta["duration"],
+        "duration_ms": video_ms,
+        "lines": lines,
+        "audio_ms": audio_ms,
+    }
 
 
 def write_captions(chapter_results, out_dir):
@@ -202,7 +225,11 @@ def write_captions(chapter_results, out_dir):
             srt.append(text)
             srt.append("")
             idx += 1
-        offset += result["audio_ms"]
+        # Advance by the chapter video's MEASURED length, not by where its narration
+        # ended. full.mp4 is a concatenation, so chapter N+1 starts at the sum of the
+        # real durations; offsetting by narration end lets captions drift chapter over
+        # chapter against the picture they belong to.
+        offset += result.get("duration_ms") or result["audio_ms"]
     write_text(out_dir / "full.vtt", "\n".join(vtt).rstrip() + "\n")
     write_text(out_dir / "full.srt", "\n".join(srt).rstrip() + "\n")
 
@@ -210,7 +237,9 @@ def write_captions(chapter_results, out_dir):
 def main():
     parser = argparse.ArgumentParser(description="Step 10: compose final videos")
     parser.add_argument("--project-id", required=True)
-    parser.add_argument("--chapter", type=int, default=None)
+    # Not type=int: compared as a string against whatever script_final.json holds, so
+    # this works on projects written before chapter_id was pinned to an integer.
+    parser.add_argument("--chapter", default=None, help="chapter_id to compose, exactly as written in script_final.json")
     parser.add_argument("--voice", choices=["female", "male"], default=None)
     args = parser.parse_args()
 
@@ -224,10 +253,11 @@ def main():
     script_obj = load_json(project_dir / "script_final.json")
     chapters = [ch.get("chapter_id", i) for i, ch in enumerate(script_obj.get("chapters", []) or [], 1) if isinstance(ch, dict)]
     if args.chapter is not None:
-        if args.chapter not in chapters:
-            print(f"Error: chapter {args.chapter} not found", file=sys.stderr)
+        selected = [c for c in chapters if str(c) == str(args.chapter)]
+        if not selected:
+            print(f"Error: chapter {args.chapter!r} not found; script has {chapters}", file=sys.stderr)
             sys.exit(1)
-        chapters = [args.chapter]
+        chapters = selected
 
     results = []
     try:
@@ -241,7 +271,7 @@ def main():
             write_captions(results, out_dir)
             full_meta = ffprobe(full)
             expected_s = sum(r["audio_ms"] for r in results) / 1000.0
-            if abs(full_meta["duration"] - expected_s) > 1.5:
+            if abs(full_meta["duration"] - expected_s) > 0.5:
                 print(
                     f"Warning: full duration {full_meta['duration']:.2f}s differs from narration {expected_s:.2f}s",
                     file=sys.stderr,

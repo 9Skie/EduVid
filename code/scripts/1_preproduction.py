@@ -43,8 +43,16 @@ from elevenlabs import ElevenLabs
 from openai import OpenAI
 
 
-RATE_PER_MIN = 270
-DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
+# Hanzi spoken per minute. duration_to_word_limits() gates on chinese_char_count(),
+# which counts hanzi ONLY -- punctuation, whitespace, ASCII and digits are excluded --
+# so this constant must be in hanzi/min, not raw TTS characters.
+# Measured from projects/smoke: 1876 hanzi -> 639.92s of eleven_v3 audio
+# (voice W8lBaQb9YIoddhxfQNLP, speed 1.2) = 175.9 hanzi/min. The previous value of 270
+# was ~53% high, so a 7-minute target authored a script that spoke for 10.7 minutes.
+# Narration length is an estimate by design: if it drifts, correct this number rather
+# than measuring it at runtime.
+RATE_PER_MIN = 176
+DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/kimi-k3")
 MAX_TURNS = 80
 MAX_PHASE_FAILURES = 6
 MAX_WEB_CALLS = 16
@@ -612,9 +620,16 @@ def validate_script(script, context_pack, word_min, word_max, check_length=False
             errors.append("each chapter must be an object")
             continue
         cid = ch.get("chapter_id")
-        if cid in seen_chapters:
+        # chapter_id must be a positive int. It is not decoration: it indexes filenames
+        # in every later stage (audio/voice_chapter_N_*.mp3, clip_plans/route_chapter_N.json,
+        # clips/chapter_N/, out/chapter_N.mp4) and --chapter has to be able to name one.
+        # Validated here rather than downstream so a bad id can never reach the disk.
+        if isinstance(cid, bool) or not isinstance(cid, int) or cid < 1:
+            errors.append(f"chapter_id must be a positive integer, got {cid!r}")
+        elif cid in seen_chapters:
             errors.append(f"duplicate chapter_id {cid}")
-        seen_chapters.add(cid)
+        else:
+            seen_chapters.add(cid)
         if not ch.get("title"):
             errors.append(f"chapter {cid} missing title")
         lines = ch.get("lines")
@@ -960,7 +975,30 @@ def synthesize_chapter_audio(client, voice_cfg, audio_dir, voice_tag, chapter, c
     return result
 
 
-def synthesize_audio(project_dir, voice_tag):
+def report_observed_rate(results, script_obj, target_minutes):
+    """Print the rate the audio actually came out at, so RATE_PER_MIN can be corrected.
+
+    Reporting only -- never fails the run. The length gate necessarily runs before any
+    audio exists, so it can only ever estimate; this is the ground truth that says how
+    good the estimate was. If observed_rate drifts from RATE_PER_MIN, edit the constant.
+    """
+    total_s = sum(r.get("duration_s", 0) for r in results)
+    hanzi = chinese_char_count(script_text(script_obj))
+    if total_s <= 0 or not hanzi:
+        return
+    observed = hanzi / (total_s / 60.0)
+    print(
+        f"\nNarration: {hanzi} hanzi -> {total_s:.1f}s ({total_s / 60:.2f} min); "
+        f"observed rate {observed:.1f} hanzi/min vs RATE_PER_MIN={RATE_PER_MIN}",
+        file=sys.stderr,
+    )
+    if target_minutes:
+        drift = (total_s / 60.0) / target_minutes - 1.0
+        flag = "" if abs(drift) <= 0.15 else "  <-- retune RATE_PER_MIN to ~%d" % round(observed)
+        print(f"Target was {target_minutes} min; actual is {drift:+.0%} off.{flag}", file=sys.stderr)
+
+
+def synthesize_audio(project_dir, voice_tag, target_minutes=None):
     """Turn finalized script_final.json into per-chapter ElevenLabs audio + timestamps."""
     script_path = project_dir / "script_final.json"
     if not script_path.exists():
@@ -1012,6 +1050,7 @@ def synthesize_audio(project_dir, voice_tag):
         },
     )
     print(f"Saved {audio_dir / 'audio_manifest.json'}", file=sys.stderr)
+    report_observed_rate(results, script_obj, target_minutes)
 
 
 def main():
@@ -1027,10 +1066,10 @@ def main():
     tools_dir = code_dir / "tools"
     load_dotenv(code_dir / ".env")
 
-    api_key = os.environ.get("KIMI_API_KEY", "")
-    api_base = os.environ.get("KIMI_API_BASE", "https://api.moonshot.cn/v1")
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    api_base = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
     if not api_key:
-        print("Error: KIMI_API_KEY not set in .env", file=sys.stderr)
+        print("Error: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
 
     pre_prompt_path = tools_dir / "prompts" / "1_preproduction.json"
@@ -1093,7 +1132,11 @@ def main():
         if state["phase"] == "done":
             finalize(project_dir, work_dir, project_id, args.model, word_min, word_max, state, tool_log, args.debug)
             if not args.skip_tts:
-                synthesize_audio(project_dir, args.voice or job.get("narration_gender"))
+                synthesize_audio(
+                    project_dir,
+                    args.voice or job.get("narration_gender"),
+                    target_minutes=job.get("target_minutes", 14),
+                )
             return
 
         messages.append(

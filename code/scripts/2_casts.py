@@ -43,10 +43,10 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image, ImageOps
+from PIL import Image
 
 
-DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
+DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/kimi-k3")
 WIKI_API = "https://zh.wikipedia.org/w/api.php"
 WIKI_HOST = "zh.wikipedia.org"
 WIKI_HEADERS = {"User-Agent": "EduVidCasts/1.0 (local educational video pipeline)"}
@@ -225,9 +225,16 @@ def resize_longest_edge(img, max_edge):
 
 
 def save_jpg(img, out_path, max_edge=IMAGE_MAX_EDGE):
-    """Save every generated/reference image as exact 1280x720, 100 DPI."""
+    """Save a reference image with its native aspect ratio intact, long edge capped.
+
+    These are identity references fed to GPT Image 2 and Seedance, not video frames --
+    nothing downstream requires 16:9 (the 1280x720 gate in 4_compose.py applies to
+    rendered clips). This used to ImageOps.fit() to 1280x720, which scales to fill and
+    centre-crops: a full-body character sheet lost everything but a torso band, and a
+    wide multi-pose design sheet lost its outer poses. Scale only, never crop.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img = ImageOps.fit(img.convert("RGB"), (1280, 720), Image.LANCZOS, centering=(0.5, 0.5))
+    img = resize_longest_edge(img.convert("RGB"), max_edge)
     img.save(out_path, format="JPEG", quality=90, dpi=(100, 100))
 
 
@@ -322,17 +329,31 @@ def call_image_api(api_key, prompt, input_references=None, label=""):
             raise
 
 
+def chapter_buckets(chapter_ids):
+    """The exact bucket vocabulary for this script: consistent, or one real chapter."""
+    return ["consistent"] + [f"chapter_{cid}" for cid in chapter_ids]
+
+
 def bucket_to_chapters(bucket, chapter_ids):
+    """Map a roster bucket onto real chapter ids.
+
+    Matches against the actual ids rather than parsing an int out of the bucket name,
+    so this cannot silently mis-scope when ids are not what the regex expected.
+    Unrecognised buckets fall back to every chapter, which is the safe direction: a
+    cast member available everywhere can go unused, one wrongly scoped out cannot be drawn.
+    """
+    bucket = str(bucket or "").strip()
     if bucket == "consistent":
         return chapter_ids
-    m = re.fullmatch(r"chapter_(\d+)", str(bucket or ""))
-    if m:
-        n = int(m.group(1))
-        return [n] if n in chapter_ids else chapter_ids
+    for cid in chapter_ids:
+        if bucket == f"chapter_{cid}":
+            return [cid]
     return chapter_ids
 
 
 def validate_roster_factory(chapter_ids):
+    valid_buckets = set(chapter_buckets(chapter_ids))
+
     def validate(parsed):
         errors = []
         roster = parsed.get("roster") if isinstance(parsed, dict) else None
@@ -358,12 +379,8 @@ def validate_roster_factory(chapter_ids):
                 errors.append(f"{cast_id} missing name")
             if kind not in ("character", "location"):
                 errors.append(f"{cast_id} kind must be character or location")
-            if bucket != "consistent" and not re.fullmatch(r"chapter_\d+", bucket or ""):
-                errors.append(f"{cast_id} bucket must be consistent or chapter_N")
-            if re.fullmatch(r"chapter_\d+", bucket or ""):
-                n = int(bucket.split("_", 1)[1])
-                if n not in chapter_ids:
-                    errors.append(f"{cast_id} bucket {bucket} not in script chapters")
+            if bucket not in valid_buckets:
+                errors.append(f"{cast_id} bucket {bucket!r} must be one of {sorted(valid_buckets)}")
         return errors
     return validate
 
@@ -576,10 +593,10 @@ def main():
     chapter_list = build_chapter_list(chapters)
 
     prompt = load_json(code_dir / "tools" / "prompts" / "2_casts.json")
-    kimi_key = os.environ.get("KIMI_API_KEY", "")
-    kimi_base = os.environ.get("KIMI_API_BASE", "https://api.moonshot.cn/v1")
+    kimi_key = os.environ.get("OPENROUTER_API_KEY", "")
+    kimi_base = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
     if not kimi_key:
-        print("Error: KIMI_API_KEY not set in .env", file=sys.stderr)
+        print("Error: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
     client = OpenAI(api_key=kimi_key, base_url=kimi_base, timeout=600)
 

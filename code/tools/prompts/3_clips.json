@@ -40,13 +40,16 @@
     ]
   },
   "motion_generate": {
-    "html_rules": "冻结主题由 3_clips.py 从 scripts/theme.ts 注入到每个 motion clip 的 HTML wrapper。你只写 #stage 内部的场景内容和可选 window.renderAt(ms) 动画逻辑，不要写 <html>/<head>/<body>/<style>，不要重新定义颜色、字体、字号、间距、背景或 CSS variables，不要引用任何外部资源、CDN、字体或图片。舞台固定 1280x720，背景不透明。动画必须严格按 keyframe_plan 的相对时间窗执行：每个窗口的动作在它的 t_ms 区间内发生，总时长 duration_ms，播完停在最后一帧。绝对静音：不使用任何 Audio、语音或提示音。要显示的文字、符号、公式、标签与 keyframe_plan 一字不差；排版清晰、对比度高、中文不溢出。",
+    "html_rules": "冻结主题由 3_clips.py 从 scripts/theme.ts 注入到每个 motion clip 的 HTML wrapper（完整 CSS 见 system 消息末尾）。你只写 #stage 内部的场景内容和可选 window.renderAt(ms) 动画逻辑，不要写 <html>/<head>/<body>/<style>，不要重新定义颜色、字体、字号、间距、背景或 CSS variables，不要引用任何外部资源、CDN、字体或图片。舞台固定 1280x720，背景不透明。\n\n配色与排版：只用主题里的 CSS 变量和 edu-* 类，不要写死 #rrggbb 或 rgb() 颜色。SVG 已设为 fill: currentColor，所以 .edu-primary / .edu-accent / .edu-highlight / .edu-muted 等类同样能给 SVG 图形上色；描边图形用 .edu-outline 或 .edu-hairline。\n\n渲染方式：渲染器逐帧调用 window.renderAt(ms) 并把所有 CSS 动画的 currentTime 同步设为同一个 ms，然后截图。因此 renderAt(ms) 必须是纯函数式的——只根据传入的 ms 决定画面，不能依赖累计状态、setTimeout、requestAnimationFrame 或 Date.now()；同一个 ms 调用两次必须得到同一帧。若使用 CSS 动画，各元素的先后顺序靠 inline style 的 animation-delay 用绝对毫秒表达。用 JS 创建 SVG 元素时可以使用 createElementNS 及其命名空间常量 http://www.w3.org/2000/svg；url(#id) 引用本片段内定义的 marker/gradient/clipPath 也是允许的。\n\n动画必须严格按 keyframe_plan 的相对时间窗执行：每个窗口的动作在它的 t_ms 区间内发生，总时长 duration_ms，播完停在最后一帧。画面必须真的随时间变化——整段完全静止的画面会被判为空片并退回重做。绝对静音：不使用任何 Audio、语音或提示音。要显示的文字、符号、公式、标签与 keyframe_plan 一字不差；排版清晰、对比度高、中文不溢出。",
     "task": "clip 视觉大意：{summary}\n总时长：{duration_ms}ms\n\nkeyframe_plan：\n{keyframe_plan}\n\n请只输出 #stage 内部内容（可含 <script> 定义 window.renderAt(ms)），不要完整 html 文档，不要解释。",
     "constraints": [
       "只输出 #stage 内部内容，不要 <html>/<head>/<body>/<style>，不要 markdown 代码块标记",
       "冻结主题已注入；不要重新定义颜色、字体、字号、间距、背景或 CSS variables",
-      "不引用任何外部资源，不发出任何声音",
+      "颜色只用 CSS 变量和 edu-* 类，不要写死 #rrggbb 或 rgb()",
+      "不引用任何外部资源，不发出任何声音（createElementNS 的 W3C 命名空间和 url(#id) 除外）",
+      "window.renderAt(ms) 必须是纯函数：只依赖传入的 ms，不用 setTimeout/rAF/Date.now，同一 ms 必须得到同一帧",
       "时间轴严格按 keyframe_plan 的相对时间窗，播完停在最后一帧",
+      "画面必须随时间变化；整段静止会被判为空片退回",
       "确切文字/符号/公式/标签与 keyframe_plan 一字不差"
     ]
   }

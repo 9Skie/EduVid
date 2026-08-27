@@ -39,10 +39,36 @@ html, body {
   overflow: hidden;
   background: var(--bg);
 }
+/* SVG paint bridge. Generated scenes are usually a single inline <svg>, and SVG
+   ignores `color` unless paint is routed through currentColor. Defaulting fill to
+   currentColor makes every role class below work identically on HTML and on SVG,
+   so the model can pick a semantic class instead of hard-coding a hex. */
+#stage svg { display: block; }
+#stage svg text { font-family: var(--font); }
+/* Default the paint to currentColor only where the author has NOT set fill themselves.
+   Wrapped in :where() so this carries zero specificity: an explicit fill="..." attribute
+   is excluded outright, and the role classes below (.edu-primary, .edu-outline, ...)
+   still win. Setting fill unconditionally here would silently repaint every author
+   colour -- black text on a light card would turn near-white and vanish. */
+:where(#stage svg:not([fill]), #stage svg *:not([fill])) { fill: currentColor; }
+
 .edu-title { font-size: var(--type-title); font-weight: 700; color: var(--fg); }
 .edu-body { font-size: var(--type-body); color: var(--fg); }
 .edu-label { font-size: var(--type-label); color: var(--neutral); }
 .edu-small { font-size: var(--type-small); color: var(--neutral); }
+
+/* Semantic paint roles. Use these instead of literal colours; they set `color` so
+   HTML text, SVG fill and `stroke: currentColor` all follow the same token. */
+.edu-fg { color: var(--fg); }
+.edu-muted { color: var(--neutral); }
+.edu-primary { color: var(--primary); }
+.edu-accent { color: var(--accent); }
+.edu-highlight { color: var(--highlight); }
+.edu-correct { color: var(--correct); }
+.edu-error { color: var(--error); }
+/* Outline variants: paint the stroke, leave the interior empty. */
+.edu-outline { fill: none; stroke: currentColor; stroke-width: 4; stroke-linejoin: round; stroke-linecap: round; }
+.edu-hairline { fill: none; stroke: currentColor; stroke-width: 2; }
 .edu-card {
   background: var(--card);
   border-radius: var(--radius);

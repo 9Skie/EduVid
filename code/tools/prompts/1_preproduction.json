@@ -52,7 +52,7 @@
       "teaching_points"
     ],
     "script_required": [
-      "chapters[].chapter_id",
+      "chapters[].chapter_id（必须是正整数，从 1 开始连续编号，不要用 ch1 这类字符串）",
       "chapters[].title",
       "chapters[].lines[].line_id",
       "chapters[].lines[].text",

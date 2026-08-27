@@ -32,11 +32,13 @@ Usage (run from code/ with venv activated):
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -53,7 +55,7 @@ from openai import OpenAI
 from PIL import Image, ImageOps
 
 
-DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "kimi-k3")
+DEFAULT_MODEL = os.environ.get("KIMI_MODEL", "moonshotai/kimi-k3")
 METHODS = {"seedance", "motion_graphics"}
 GAP_TOLERANCE_MS = 60
 FPS = 24
@@ -66,6 +68,22 @@ OPENROUTER_VIDEO_API = f"{OPENROUTER_API}/videos"
 IMAGE_MODEL = "openai/gpt-image-2"
 SEEDANCE_MODEL = "bytedance/seedance-2.0"
 MAX_WORKERS = 8  # concurrent clip-level describe/generate; chapters stay sequential
+MOTION_ATTEMPTS = 3  # regenerate a rejected motion fragment, feeding errors back
+SEEDANCE_ATTEMPTS = 3  # retry transient video failures; a rejected payload is fatal
+SEEDANCE_POLL_TRIES = 90  # x10s = 15 min, above the observed tail for 720p 15s jobs
+MIN_FRAGMENT_CHARS = 200
+
+
+class StaticRenderError(RuntimeError):
+    """The stage renders identically across the clip: blank or frozen output."""
+
+
+class SeedanceFatal(RuntimeError):
+    """A Seedance failure that retrying cannot fix (rejected payload)."""
+
+
+class SeedanceJobDead(RuntimeError):
+    """The provider reported the job failed/cancelled/expired: it cannot be collected."""
 
 _TRACE_DIR = None
 _TRACE_LOCK = threading.Lock()
@@ -108,8 +126,14 @@ def load_json(path):
 
 
 def write_json(path, obj):
+    """Write atomically: the clips manifest is rewritten as each clip settles, and a
+    process killed mid-write must not leave a truncated file that 4_compose cannot parse.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def run_cmd(cmd, timeout=600):
@@ -234,7 +258,12 @@ def image_to_data_url(path):
 
 
 def save_jpg(img, out_path, max_edge=1024):
-    """Save every generated image as exact 1280x720, 100 DPI."""
+    """Save a storyboard frame as exact 1280x720, 100 DPI.
+
+    Unlike the cast references in 2_casts.py, cropping to 16:9 is correct here: a
+    storyboard is submitted to Seedance as first_frame for a 16:9 clip, so it has to
+    match the video's geometry rather than preserve its own.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img = ImageOps.fit(img.convert("RGB"), (1280, 720), Image.LANCZOS, centering=(0.5, 0.5))
     img.save(out_path, format="JPEG", quality=90, dpi=(100, 100))
@@ -318,7 +347,8 @@ def select_seedance_refs(reference_paths):
     return ordered
 
 
-def submit_seedance(api_key, prompt, duration_s, out_path, reference_paths=None, first_frame_path=None, prev_last_frame_b64=None, label=""):
+def _seedance_submit(api_key, prompt, duration_s, out_path, reference_paths=None, first_frame_path=None, prev_last_frame_b64=None, label=""):
+    """Submit one segment and return its job id. Everything after this point is billed."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": SEEDANCE_MODEL,
@@ -349,7 +379,12 @@ def submit_seedance(api_key, prompt, duration_s, out_path, reference_paths=None,
 
     resp = requests.post(OPENROUTER_VIDEO_API, headers=headers, json=payload, timeout=60)
     if resp.status_code not in (200, 202):
-        raise RuntimeError(f"seedance submit failed {resp.status_code}: {resp.text[:500]}")
+        msg = f"seedance submit failed {resp.status_code}: {resp.text[:500]}"
+        # A 4xx means the payload itself was rejected (too many references, bad prompt);
+        # resending it unchanged just spends money to fail identically. 429 is transient.
+        if 400 <= resp.status_code < 500 and resp.status_code != 429:
+            raise SeedanceFatal(msg)
+        raise RuntimeError(msg)
     job_id = resp.json().get("id")
     if not job_id:
         raise RuntimeError(f"seedance submit returned no id: {resp.text[:500]}")
@@ -366,7 +401,18 @@ def submit_seedance(api_key, prompt, duration_s, out_path, reference_paths=None,
         }
     )
 
-    for _ in range(60):
+    return job_id
+
+
+def _seedance_collect(api_key, job_id, out_path):
+    """Poll one already-submitted job to completion and download it.
+
+    Deliberately separate from submission: everything here happens AFTER the generation
+    has been bought, so a failure in this half must be retried against the same job_id
+    rather than by buying another one.
+    """
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    for _ in range(SEEDANCE_POLL_TRIES):
         time.sleep(10)
         poll = requests.get(f"{OPENROUTER_VIDEO_API}/{job_id}", headers=headers, timeout=30)
         poll.raise_for_status()
@@ -385,8 +431,48 @@ def submit_seedance(api_key, prompt, duration_s, out_path, reference_paths=None,
             out_path.write_bytes(body)
             return
         if status in ("failed", "cancelled", "expired"):
-            raise RuntimeError(f"seedance job {status}: {data}")
+            raise SeedanceJobDead(f"seedance job {status}: {str(data)[:300]}")
     raise RuntimeError("seedance polling timed out")
+
+
+def submit_seedance(api_key, prompt, duration_s, out_path, reference_paths=None, first_frame_path=None, prev_last_frame_b64=None, label=""):
+    """Generate one Seedance segment, retrying transient failures without re-buying.
+
+    Video generation is the most expensive step and the most likely to fail for reasons
+    that clear on their own. Without any retry a single blip cost the whole chapter,
+    since the exception unwinds through the clip pool. But a retry that re-POSTs is
+    almost as bad: a hiccup while polling or downloading would abandon a generation
+    already paid for and order another. So the job id is held across attempts and only
+    a job the provider reports as dead -- or a submit that never produced an id --
+    causes a new submission.
+    """
+    job_id = None
+    last = None
+    for attempt in range(1, SEEDANCE_ATTEMPTS + 1):
+        try:
+            if job_id is None:
+                job_id = _seedance_submit(
+                    api_key, prompt, duration_s, out_path,
+                    reference_paths=reference_paths,
+                    first_frame_path=first_frame_path,
+                    prev_last_frame_b64=prev_last_frame_b64,
+                    label=label,
+                )
+            return _seedance_collect(api_key, job_id, out_path)
+        except SeedanceFatal:
+            raise
+        except SeedanceJobDead as e:
+            last = e
+            job_id = None  # the generation itself failed; finishing it is not possible
+            print(f"    seedance attempt {attempt}/{SEEDANCE_ATTEMPTS}: {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            where = "submit" if job_id is None else f"poll/download of job {job_id}"
+            print(f"    seedance attempt {attempt}/{SEEDANCE_ATTEMPTS} failed at {where}: {e}", file=sys.stderr)
+        if attempt < SEEDANCE_ATTEMPTS:
+            # Jitter by clip so 8 concurrent workers do not retry in lockstep.
+            time.sleep(15 * attempt + (hash(label) % 7))
+    raise RuntimeError(f"seedance failed after {SEEDANCE_ATTEMPTS} attempts: {last}")
 
 
 def frame_snap(input_path, target_frames, output_path):
@@ -406,12 +492,19 @@ def frame_snap(input_path, target_frames, output_path):
     tmp.replace(output_path)
 
 
-def encode_frames_to_mp4(frames_dir, out_path, input_fps):
+def encode_frames_to_mp4(frames_dir, out_path, input_fps, total_frames=None):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y", "-framerate", str(input_fps),
         "-i", str(frames_dir / "frame_%04d.png"),
-        "-vf", "scale=1280:720", "-r", str(FPS), "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-vf", "scale=1280:720", "-r", str(FPS),
+    ]
+    # Cap the output so the clip can never exceed the frames the plan allotted it,
+    # whatever happens to be sitting in frames_dir.
+    if total_frames:
+        cmd += ["-frames:v", str(int(total_frames))]
+    cmd += [
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
         str(out_path),
     ]
     proc = run_cmd(cmd)
@@ -499,6 +592,85 @@ def enrich_clip_times(clips, lines_by_id):
             clip["end_ms"] = max(ends)
             clip["duration_ms"] = clip["end_ms"] - clip["start_ms"]
     return clips
+
+
+def snap_clips_to_frames(clips):
+    """Give every clip an integer frame count whose boundaries telescope.
+
+    Clips are placed by concatenation, not by seeking to start_ms, so rounding each
+    duration to whole frames independently lets the video drift against the narration
+    and the drift compounds with clip count. Chaining each clip's start frame to the
+    previous clip's end frame means the total is always round(chapter_end_ms) frames
+    and the error can never exceed half a frame no matter how many clips there are.
+
+    Idempotent: end_frame derives from end_ms, which this never modifies.
+    """
+    prev_end_frame = 0
+    for clip in clips:
+        if clip.get("start_ms") is None or clip.get("end_ms") is None:
+            continue
+        end_frame = max(prev_end_frame + 1, round(clip["end_ms"] / 1000 * FPS))
+        clip["start_frame"] = prev_end_frame
+        clip["end_frame"] = end_frame
+        clip["frames"] = end_frame - prev_end_frame
+        clip["duration_ms"] = round(clip["frames"] * 1000 / FPS)
+        prev_end_frame = end_frame
+    return clips
+
+
+def _video_is_static(path, duration_ms):
+    """Do three frames sampled across the video come out byte-identical?
+
+    Encoded-file counterpart of the pre-flight probe in render_motion_html. It exists
+    because blank clips predate the fragment validator: a 21s file of flat background
+    has exactly the right geometry and frame count, so without this the resume path
+    would happily adopt one and stamp it ok. A probe that cannot run counts as static,
+    since regenerating a good clip only costs time, while reusing a blank one ships it.
+    """
+    digests = set()
+    for fraction in (0.1, 0.5, 0.9):
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{duration_ms / 1000 * fraction:.3f}",
+                 "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                capture_output=True, timeout=60,
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        if proc.returncode != 0 or not proc.stdout:
+            return True
+        digests.add(hashlib.md5(proc.stdout).hexdigest())
+    return len(digests) == 1
+
+
+def _clip_output_ok(path, duration_ms, expected_frames=None):
+    """Is an existing clip/segment mp4 trustworthy enough to skip regenerating it?
+
+    Guards the resume path. A file on disk may be truncated, may be from a stale plan,
+    or may be a blank render from before the fragment validator existed. Checks that the
+    geometry and frame count match what the current plan asks for, and that the picture
+    actually changes.
+    """
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < 1024:
+        return False
+    want = int(expected_frames or max(1, round(duration_ms / 1000 * FPS)))
+    try:
+        proc = run_cmd(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,nb_frames", "-of", "json", str(path)],
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            return False
+        stream = (json.loads(proc.stdout or "{}").get("streams") or [{}])[0]
+        if stream.get("width") != 1280 or stream.get("height") != 720:
+            return False
+        if abs(int(stream.get("nb_frames") or 0) - want) > 1:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return not _video_is_static(path, duration_ms)
 
 
 def validate_route_factory(timed_lines, cast_ids):
@@ -713,8 +885,8 @@ def split_seedance_clips(clips, client, model):
     plan_by_id = {}
     plans = []
     for clip in clips:
-        if clip.get("method") != "seedance":
-            continue
+        if clip.get("method") != "seedance" or clip.get("segments"):
+            continue  # already split on a previous run; the plan is persisted
         if len(clip.get("_char_timings", [])) < 2 or "start_ms" not in clip or "end_ms" not in clip:
             continue
         dur = (clip["end_ms"] - clip["start_ms"]) / 1000.0
@@ -736,7 +908,7 @@ def split_seedance_clips(clips, client, model):
             print(f"  Split LLM failed ({e}); equal split for all", file=sys.stderr)
 
     for clip in clips:
-        if clip.get("method") != "seedance":
+        if clip.get("method") != "seedance" or clip.get("segments"):
             continue
         cid = clip["clip_id"]
         if cid in plan_by_id:
@@ -829,19 +1001,28 @@ def _strip_fence(text):
     return text.strip()
 
 
-def kimi_motion_html(client, model, cfg, clip):
+def build_motion_messages(cfg, clip, theme_css):
+    """Opening turns for a motion fragment.
+
+    The frozen theme is pasted into the system message. It was previously only injected
+    into the rendered HTML, so the model never saw the palette or the edu-* classes it
+    was told not to redefine -- and predictably ignored them, hard-coding its own hexes.
+    """
     constraints = "\n".join(f"- {c}" for c in cfg.get("constraints", []))
-    messages = [
-        {"role": "system", "content": f"{cfg['html_rules']}\n\n约束：\n{constraints}"},
-        {
-            "role": "user",
-            "content": cfg["task"]
-            .replace("{summary}", clip.get("summary", ""))
-            .replace("{duration_ms}", str(clip["duration_ms"]))
-            .replace("{keyframe_plan}", json.dumps(clip.get("describe", {}).get("keyframe_plan", []), ensure_ascii=False, indent=2)),
-        },
-    ]
-    return _strip_fence(stream_text(client, messages, model, label=f"motion_html {clip.get('clip_id', '?')}"))
+    system = (
+        f"{cfg['html_rules']}\n\n约束：\n{constraints}\n\n"
+        "以下冻结主题 CSS 已经注入到页面，是颜色、字体、字号、间距的唯一来源。"
+        "直接使用其中的 CSS 变量和 edu-* 类（SVG 用 fill: currentColor 继承，"
+        "所以 .edu-primary 这类类同样作用于 SVG 图形）；不要另外写死颜色或字体：\n"
+        f"{theme_css}"
+    )
+    user = (
+        cfg["task"]
+        .replace("{summary}", clip.get("summary", ""))
+        .replace("{duration_ms}", str(clip["duration_ms"]))
+        .replace("{keyframe_plan}", json.dumps(clip.get("describe", {}).get("keyframe_plan", []), ensure_ascii=False, indent=2))
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def load_theme_css(code_dir):
@@ -853,12 +1034,57 @@ def load_theme_css(code_dir):
     return m.group(1)
 
 
+_ELEMENT_RE = re.compile(
+    r"<(div|span|svg|p|h[1-6]|section|ul|ol|li|table|canvas|g|rect|circle|path|text|line|polygon|polyline|ellipse)\b",
+    re.I,
+)
+# Any http(s) URL except the W3C namespace URIs. createElementNS REQUIRES
+# "http://www.w3.org/2000/svg", so a blanket "http://" ban rejects every fragment that
+# builds SVG imperatively -- which is exactly the window.renderAt pattern that renders
+# best. That ban destroyed a valid 10k-char fragment (c2_clip_004) and with it a whole
+# chapter's manifest, discarding three already-rendered sibling clips.
+_EXTERNAL_URL_RE = re.compile(r"https?://(?!www\.w3\.org/)", re.I)
+
+def _has_external_url_func(fragment):
+    """Does any url(...) point outside this fragment?
+
+    url(#id) targets a marker/gradient/clipPath defined in the same fragment and is
+    safe; url(foo.png) or url("http://...") fetches a resource and is not. Written as a
+    scan rather than one regex because the quoting is variable -- url(#g), url('#g'),
+    url( "#g" ) are all legal CSS/SVG -- and a lookahead after optional quotes silently
+    backtracks past them, which would reject exactly the internal references the prompt
+    tells the model to use.
+    """
+    for m in re.finditer(r"url\(", fragment, re.I):
+        rest = fragment[m.end():].lstrip().lstrip("\"'").lstrip()
+        if not rest.startswith("#"):
+            return True
+    return False
+
+
 def validate_motion_fragment(fragment):
-    forbidden = [
-        "<html", "<head", "<body", "<style", "http://", "https://", "<link", "@import",
-        "<audio", "<video", "<img", "<iframe", "url(",
-    ]
+    """Post-conditions on the #stage fragment, both negative and positive.
+
+    Negative: no document scaffolding, no external resources, no media elements.
+    Positive: non-empty, long enough to be a scene, containing something renderable.
+
+    The positive half is what stops the silent failure: an empty fragment wraps into a
+    legal HTML document, renders as N frames of flat background, and gets stamped ok.
+    """
+    text = (fragment or "").strip()
+    if not text:
+        return ["fragment is empty: the model returned nothing"]
+
+    forbidden = ["<html", "<head", "<body", "<style", "<link", "@import", "<audio", "<video", "<img", "<iframe"]
     errors = [f"forbidden fragment content: {x}" for x in forbidden if x in fragment]
+    if _EXTERNAL_URL_RE.search(fragment):
+        errors.append("forbidden external URL (the http://www.w3.org/... namespace URIs are allowed)")
+    if _has_external_url_func(fragment):
+        errors.append("forbidden external url() reference (internal url(#id) is allowed)")
+    if len(text) < MIN_FRAGMENT_CHARS:
+        errors.append(f"fragment is only {len(text)} chars, too short to be a real scene")
+    if not _ELEMENT_RE.search(text):
+        errors.append("fragment contains no renderable element")
     return errors
 
 
@@ -874,43 +1100,94 @@ def wrap_motion_html(fragment, duration_ms, theme_css):
     )
 
 
-def render_motion_html(html_path, out_path, duration_ms):
+def render_motion_html(html_path, out_path, duration_ms, total_frames=None):
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("motion renderer needs Python Playwright + Chromium installed") from e
 
     frames_dir = Path(html_path).parent / "frames_render"
-    frames_dir.mkdir(parents=True, exist_ok=True)
-    total_frames = max(1, round(duration_ms / 1000 * FPS))
+    total_frames = max(1, int(total_frames or round(duration_ms / 1000 * FPS)))
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 720})
         page.goto("file://" + str(Path(html_path).resolve()))
         page.evaluate("document.getAnimations().forEach(a=>{a.pause(); a.currentTime=0;})")
-        for i in range(total_frames):
-            t = round(i / FPS * 1000)
+
+        def seek(t):
             page.evaluate(
                 "(t)=>{ if (window.renderAt) window.renderAt(t); document.getAnimations().forEach(a=>{a.pause(); a.currentTime=t;}); }",
                 t,
             )
+
+        # Pre-flight. A stage that is byte-identical at five points across its span is
+        # blank or frozen; catch it in ~2s rather than after a 500-frame render. Runs
+        # before frames_dir is created so a rejected clip leaves nothing behind.
+        probes = set()
+        for fraction in (0.0, 0.25, 0.5, 0.75, 0.98):
+            seek(round(duration_ms * fraction))
+            probes.add(hashlib.md5(page.screenshot()).hexdigest())
+        if len(probes) == 1:
+            browser.close()
+            raise StaticRenderError(
+                "stage is identical at 0/25/50/75/98% of the clip: nothing renders, or nothing moves"
+            )
+
+        # Clear frames from any earlier attempt first. encode_frames_to_mp4 ingests the
+        # whole contiguous frame_%04d.png run, so a stale trailing frame from a longer
+        # previous render would be appended to this clip -- both making it a frame too
+        # long and ending it on leftover picture from the render being replaced.
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(total_frames):
+            seek(round(i / FPS * 1000))
             page.screenshot(path=str(frames_dir / f"frame_{i:04d}.png"))
         browser.close()
-    encode_frames_to_mp4(frames_dir, out_path, FPS)
+    encode_frames_to_mp4(frames_dir, out_path, FPS, total_frames)
+    # Only on success: a failed render keeps its frames for inspection.
+    shutil.rmtree(frames_dir, ignore_errors=True)
 
 
 def generate_motion_clip(client, model, prompt, clip, clip_dir):
+    """Generate -> validate -> render, retrying with the rejection reason fed back.
+
+    Mirrors call_llm_json's contract: the model gets told exactly what was wrong and
+    tries again. A single-shot call here is how an empty response became a blank clip.
+    Infrastructure failures (no Playwright) raise straight out rather than burning
+    attempts on an error the model cannot fix.
+    """
     clip_dir.mkdir(parents=True, exist_ok=True)
-    fragment = kimi_motion_html(client, model, prompt["motion_generate"], clip)
-    errors = validate_motion_fragment(fragment)
-    if errors:
-        raise RuntimeError("motion fragment rejected: " + "; ".join(errors))
     theme_css = load_theme_css(Path(__file__).parent.parent)
+    cfg = prompt["motion_generate"]
+    messages = build_motion_messages(cfg, clip, theme_css)
     html_path = clip_dir / "clip.html"
-    html_path.write_text(wrap_motion_html(fragment, clip["duration_ms"], theme_css), encoding="utf-8")
     out_path = clip_dir / "clip.mp4"
-    render_motion_html(html_path, out_path, clip["duration_ms"])
-    return out_path
+    clip_id = clip.get("clip_id", "?")
+    total_frames = clip.get("frames")
+
+    last_errors = ["not called"]
+    for attempt in range(1, MOTION_ATTEMPTS + 1):
+        fragment = _strip_fence(stream_text(client, messages, model, label=f"motion_html {clip_id} attempt {attempt}"))
+        errors = validate_motion_fragment(fragment)
+        if not errors:
+            html_path.write_text(wrap_motion_html(fragment, clip["duration_ms"], theme_css), encoding="utf-8")
+            try:
+                render_motion_html(html_path, out_path, clip["duration_ms"], total_frames)
+                return out_path
+            except StaticRenderError as e:
+                errors = [str(e)]
+        last_errors = errors
+        print(f"  [{clip_id}] motion attempt {attempt}/{MOTION_ATTEMPTS} rejected: {errors}", file=sys.stderr)
+        if fragment:
+            messages.append({"role": "assistant", "content": fragment})
+        messages.append(
+            {
+                "role": "user",
+                "content": "上一次输出被拒绝。请修正下列问题后重新输出，只输出 #stage 内部内容：\n"
+                + json.dumps({"errors": errors}, ensure_ascii=False, indent=2),
+            }
+        )
+    raise RuntimeError(f"motion clip {clip_id} failed after {MOTION_ATTEMPTS} attempts: {last_errors}")
 
 
 def read_text_file(path):
@@ -968,7 +1245,7 @@ def _concat_videos(segment_paths, output_path):
     return output_path
 
 
-def generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_dir):
+def generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_dir, force=False):
     clip_dir.mkdir(parents=True, exist_ok=True)
     cast_ids = clip.get("cast_ids", [])
     # All needed references for this clip: characters and environments/locations.
@@ -984,12 +1261,30 @@ def generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_di
     segment_paths = []
     prev_frame = None
 
+    # Segment frame counts telescope inside the clip the same way clip frames telescope
+    # inside the chapter, so the concatenated segments sum to exactly clip["frames"].
+    clip_start_frame = clip.get("start_frame", round(clip["start_ms"] / 1000 * FPS))
+    clip_end_frame = clip.get("end_frame", round(clip["end_ms"] / 1000 * FPS))
+    prev_boundary = clip_start_frame
+
     for i, seg in enumerate(segments):
         seg_duration = (seg["end_ms"] - seg["start_ms"]) / 1000.0
         if seg_duration <= 0:
             continue
+        is_last = i == len(segments) - 1
+        seg_end_frame = clip_end_frame if is_last else round(seg["end_ms"] / 1000 * FPS)
+        seg_frames = max(1, seg_end_frame - prev_boundary)
+        prev_boundary = seg_end_frame
         seg_output = final if one_segment else clip_dir / f"seg_{i}.mp4"
         continuation = bool(seg.get("continuation"))
+
+        # Resume: a segment already on disk at the right length is paid for. Reuse it
+        # rather than re-billing a Seedance generation because a later segment failed.
+        if not force and _clip_output_ok(seg_output, seg["end_ms"] - seg["start_ms"], seg_frames):
+            print(f"    seg {i} already rendered ({seg_frames}f), reusing", file=sys.stderr)
+            segment_paths.append(seg_output)
+            prev_frame = extract_last_frame_b64(seg_output)
+            continue
 
         # Each generation pass gets its own storyboard image, built from the
         # references needed for this segment.
@@ -1028,7 +1323,7 @@ def generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_di
             prev_last_frame_b64=prev_frame if continuation else None,
             label=f"seedance {clip['clip_id']} seg {i}",
         )
-        frame_snap(seg_output, max(1, round(seg_duration * FPS)), seg_output)
+        frame_snap(seg_output, seg_frames, seg_output)
         segment_paths.append(seg_output)
         prev_frame = extract_last_frame_b64(seg_output)
 
@@ -1038,29 +1333,76 @@ def generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_di
     return final
 
 
-def process_generate(client, model, prompt, code_dir, project_dir, cast_entries, visual):
+def process_generate(client, model, prompt, code_dir, project_dir, cast_entries, visual, manifest_path, force=False):
+    """Generate every clip in a chapter, recording each outcome as it settles.
+
+    A clip that cannot be generated is recorded as status "failed" instead of raising
+    through the pool: one bad clip used to unwind process_generate and leave the chapter
+    with no manifest at all, discarding every sibling clip that had already succeeded --
+    including paid Seedance renders. The manifest is written before generation starts
+    and rewritten as each clip finishes, so an interruption never loses the survivors.
+    4_compose refuses any chapter whose manifest is not all-ok, which is what makes
+    recording a failure safe rather than a way to ship a hole in the video.
+    """
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-    manifest = {"chapter": visual["chapter"], "clips": []}
+    chapter_dir = project_dir / "clips" / f"chapter_{visual['chapter']}"
+    entries = {
+        c["clip_id"]: {
+            "clip_id": c["clip_id"],
+            "method": c.get("method"),
+            "video_file": str(chapter_dir / c["clip_id"] / "clip.mp4"),
+            "duration_ms": c["duration_ms"],
+            "frames": c.get("frames"),
+            "status": "pending",
+        }
+        for c in visual["clips"]
+    }
+    lock = threading.Lock()
+
+    def flush():
+        with lock:
+            write_json(manifest_path, {"chapter": visual["chapter"], "clips": [entries[c["clip_id"]] for c in visual["clips"]]})
+
+    flush()
+
     def generate_one(clip):
         clip_id = clip["clip_id"]
-        clip_dir = project_dir / "clips" / f"chapter_{visual['chapter']}" / clip_id
+        clip_dir = chapter_dir / clip_id
+        if not force and _clip_output_ok(clip_dir / "clip.mp4", clip["duration_ms"], clip.get("frames")):
+            print(f"  skip {clip_id} (already rendered)", file=sys.stderr)
+            entries[clip_id].update(status="ok", reused=True)
+            flush()
+            return
         print(f"  generate {clip_id} ({clip['method']}, {clip['duration_ms']}ms)", file=sys.stderr)
-        if clip["method"] == "seedance":
-            if not openrouter_key:
-                raise RuntimeError("OPENROUTER_API_KEY not set")
-            out = generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_dir)
-        else:
-            out = generate_motion_clip(client, model, prompt, clip, clip_dir)
-        return {"clip_id": clip_id, "method": clip["method"], "video_file": str(out), "duration_ms": clip["duration_ms"], "status": "ok"}
+        try:
+            if clip["method"] == "seedance":
+                if not openrouter_key:
+                    raise RuntimeError("OPENROUTER_API_KEY not set")
+                out = generate_seedance_clip(openrouter_key, clip, cast_entries, code_dir, clip_dir, force=force)
+            else:
+                out = generate_motion_clip(client, model, prompt, clip, clip_dir)
+            entries[clip_id].update(status="ok", video_file=str(out))
+        except Exception as e:  # noqa: BLE001
+            print(f"  FAILED {clip_id}: {e}", file=sys.stderr)
+            entries[clip_id].update(status="failed", error=str(e))
+        flush()
 
     # Clips are independent of each other (seedance segment chaining is internal
     # to each clip), so they generate in parallel; manifest stays in clip order.
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(visual["clips"]))) as pool:
-        manifest["clips"] = list(pool.map(generate_one, visual["clips"]))
-    return manifest
+    with ThreadPoolExecutor(max_workers=max(1, min(MAX_WORKERS, len(visual["clips"])))) as pool:
+        list(pool.map(generate_one, visual["clips"]))
+    return {"chapter": visual["chapter"], "clips": [entries[c["clip_id"]] for c in visual["clips"]]}
 
 
-def process_chapter(client, model, prompt, code_dir, project_dir, script_obj, chapter_id, voice):
+def _plan_without_internals(visual):
+    """Plan as it should live on disk: runtime-only keys (_char_timings) stripped."""
+    return {
+        **{k: v for k, v in visual.items() if k != "clips"},
+        "clips": [{k: v for k, v in c.items() if not k.startswith("_")} for c in visual["clips"]],
+    }
+
+
+def process_chapter(client, model, prompt, code_dir, project_dir, script_obj, chapter_id, voice, force=False):
     script_chapter = chapter_from_script(script_obj, chapter_id)
     chapter_name = script_chapter.get("title") or f"Chapter {chapter_id}"
     audio_dir = project_dir / "audio"
@@ -1083,7 +1425,10 @@ def process_chapter(client, model, prompt, code_dir, project_dir, script_obj, ch
         messages = build_route_messages(prompt, timed_script, cast_text)
         route = call_llm_json(client, messages, model, validate_route_factory(timed_lines, cast_ids), f"route chapter {chapter_id}")
         route = {"chapter": chapter_id, "chapter_name": chapter_name, "voice": voice, "clips": route["clips"]}
-        write_json(route_path, route)
+    # Snap before describe so keyframe plans are validated against the frame-exact
+    # duration the renderer will actually use. Idempotent, so cached routes get it too.
+    snap_clips_to_frames(route["clips"])
+    write_json(route_path, route)
     print(f"route: {len(route['clips'])} clips", file=sys.stderr)
 
     visual_path = plans_dir / f"visual_chapter_{chapter_id}.json"
@@ -1118,24 +1463,42 @@ def process_chapter(client, model, prompt, code_dir, project_dir, script_obj, ch
             "method_counts": dict(Counter(c.get("method") for c in route["clips"])),
             "clips": route["clips"],
         }
-        write_json(visual_path, visual)
+        write_json(visual_path, _plan_without_internals(visual))
     print(f"describe: {len(visual['clips'])} clips", file=sys.stderr)
 
+    # Snap again on the visual plan: when it is loaded from cache its clips come from
+    # the file rather than the route object just snapped above, so a plan written before
+    # frame telescoping existed would otherwise carry no frame counts and fall back to
+    # per-clip rounding. Idempotent -- frames derive from end_ms, which never changes.
+    snap_clips_to_frames(visual["clips"])
     attach_clip_char_timings(visual["clips"], chars_by_line)
-    split_seedance_clips(visual["clips"], client, model)
-    manifest = process_generate(client, model, prompt, code_dir, project_dir, cast_entries, visual)
+    if any(c.get("method") == "seedance" and not c.get("segments") for c in visual["clips"]):
+        split_seedance_clips(visual["clips"], client, model)
+        # Persist the split so a re-run reuses the same cut points instead of asking
+        # the LLM again and landing on different segment boundaries than the seg_N.mp4
+        # files already on disk.
+        write_json(visual_path, _plan_without_internals(visual))
+
     manifest_path = project_dir / "clips" / f"chapter_{chapter_id}" / "clips_manifest.json"
-    write_json(manifest_path, manifest)
+    manifest = process_generate(
+        client, model, prompt, code_dir, project_dir, cast_entries, visual, manifest_path, force=force
+    )
     print(f"Saved {manifest_path}", file=sys.stderr)
+    failed = [c["clip_id"] for c in manifest["clips"] if c.get("status") != "ok"]
+    if failed:
+        raise RuntimeError(f"{len(failed)}/{len(manifest['clips'])} clips failed: {failed} (re-run to retry only these)")
     return manifest
 
 
 def main():
     parser = argparse.ArgumentParser(description="Part 3: route -> describe -> generate clips")
     parser.add_argument("--project-id", required=True)
-    parser.add_argument("--chapter", type=int, default=None)
+    # Not type=int: compared as a string against whatever script_final.json holds, so
+    # this works on projects written before chapter_id was pinned to an integer.
+    parser.add_argument("--chapter", default=None, help="chapter_id to build, exactly as written in script_final.json")
     parser.add_argument("--voice", choices=["female", "male"], default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--force", action="store_true", help="regenerate clips even if a valid clip.mp4 already exists")
     parser.add_argument("--prompt", default="tools/prompts/3_clips.json")
     args = parser.parse_args()
 
@@ -1157,26 +1520,27 @@ def main():
         sys.exit(1)
     prompt = load_json(prompt_path)
 
-    api_key = os.environ.get("KIMI_API_KEY", "")
-    api_base = os.environ.get("KIMI_API_BASE", "https://api.moonshot.cn/v1")
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    api_base = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
     if not api_key:
-        print("Error: KIMI_API_KEY not set in .env", file=sys.stderr)
+        print("Error: OPENROUTER_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
     client = OpenAI(api_key=api_key, base_url=api_base, timeout=600)
 
     chapters = [ch.get("chapter_id", i) for i, ch in enumerate(script_obj.get("chapters", []) or [], 1) if isinstance(ch, dict)]
     if args.chapter is not None:
-        if args.chapter not in chapters:
-            print(f"Error: chapter {args.chapter} not found", file=sys.stderr)
+        selected = [c for c in chapters if str(c) == str(args.chapter)]
+        if not selected:
+            print(f"Error: chapter {args.chapter!r} not found; script has {chapters}", file=sys.stderr)
             sys.exit(1)
-        chapters = [args.chapter]
+        chapters = selected
 
     failed = []
     for chapter_id in chapters:
         try:
             process_chapter(
                 client, args.model, prompt, code_dir, project_dir, script_obj,
-                chapter_id, voice,
+                chapter_id, voice, force=args.force,
             )
         except Exception as e:  # noqa: BLE001
             print(f"FAILED chapter {chapter_id}: {e}", file=sys.stderr)

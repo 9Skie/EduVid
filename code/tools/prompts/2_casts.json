@@ -1,6 +1,6 @@
 {
   "extract": {
-    "task": "通读教学视频脚本全文，找出值得生成视觉参考图的实体，只登记不描述。标准：必须是具体、唯一、可辨认的真实人物或真实地标；两个读者读到它会想到同一个明确形象。应提取如秦始皇、欧几里得、长城、赵州桥、埃菲尔铁塔这类实体；不要提取泛指人群、未具名地点或普通物体。对每个实体登记 cast_id（英文蛇形）、name（最通用、最可能查到维基的中文名）、kind（character/location）、bucket（consistent 或 chapter_N）。bucket 规则：只要超过1个板块出现或提及，一律 consistent；真正只在一个板块出现才标 chapter_N。不要登记老师、小明、小红。",
+    "task": "通读教学视频脚本全文，找出值得生成视觉参考图的实体，只登记不描述。标准：必须是具体、唯一、可辨认的真实人物或真实地标；两个读者读到它会想到同一个明确形象。应提取如秦始皇、欧几里得、长城、赵州桥、埃菲尔铁塔这类实体；不要提取泛指人群、未具名地点或普通物体。对每个实体登记 cast_id（英文蛇形）、name（最通用、最可能查到维基的中文名）、kind（character/location）、bucket（consistent 或 chapter_N）。bucket 规则：只要超过1个板块出现或提及，一律 consistent；真正只在一个板块出现才标 chapter_N。不要登记老师、小明、小红。\n\n本脚本的板块（bucket 只能填 consistent 或下列 chapter_N 之一，不要自己编号）：\n{chapter_list}\n\n以下是脚本全文：\n{script}",
     "output_format": "输出纯 JSON，不要 markdown 代码块标记或额外解释。\n\n{\"roster\": [{\"cast_id\": \"英文蛇形命名\", \"name\": \"中文名称\", \"kind\": \"character | location\", \"bucket\": \"consistent | chapter_1 | chapter_2 | ...\"}]}"
   },
   "describe": {
